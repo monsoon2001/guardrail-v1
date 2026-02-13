@@ -958,21 +958,16 @@ import {
   updateDoc, 
   collection, 
   addDoc, 
-  serverTimestamp,
-  getDoc
 } from "firebase/firestore";
 import { Button } from "@/components/ui/button";
 import { 
-  Phone, 
   PhoneOff, 
   Video, 
   VideoOff, 
   Mic, 
   MicOff, 
-  Loader2,
   ShieldAlert,
   Clock,
-  Wifi,
   Volume2
 } from "lucide-react";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -980,32 +975,9 @@ import { useToast } from "@/hooks/use-toast";
 
 const servers = {
   iceServers: [
-    {
-      urls: [
-        'stun:stun.l.google.com:19302',
-        'stun:stun1.l.google.com:19302',
-        'stun:stun2.l.google.com:19302',
-        'stun:stun3.l.google.com:19302',
-        'stun:stun4.l.google.com:19302',
-      ],
-    },
-    {
-      // PLACEHOLDER TURN SERVERS (e.g., Metered.ca Open Relay)
-      // For production, replace with your own Twilio or Metered.ca credentials
-      urls: "turn:openrelay.metered.ca:80",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
-    {
-      urls: "turn:openrelay.metered.ca:443",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
-    {
-      urls: "turn:openrelay.metered.ca:443?transport=tcp",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
+    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+    { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
+    { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
   ],
   iceCandidatePoolSize: 10,
 };
@@ -1024,19 +996,17 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
   const [permissionError, setPermissionError] = useState(false);
   const [callStartTime, setCallStartTime] = useState<number | null>(null);
   const [duration, setDuration] = useState<string>("0:00");
-  const [isHardwareStarted, setIsHardwareStarted] = useState(false);
   const [needsAutoplayGesture, setNeedsAutoplayGesture] = useState(false);
   
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const remoteAudioRef = useRef<HTMLAudioElement>(null);
-  const ringtoneRef = useRef<HTMLAudioElement | null>(null);
   
   const pc = useRef<RTCPeerConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const iceBuffer = useRef<RTCIceCandidateInit[]>([]);
   const isInitialized = useRef(false);
-  const unsubscribes = useRef<(() => void)[]>([]);
+  const isHandshakeDone = useRef(false);
 
   const stopAllTracks = (stream: MediaStream | null) => {
     if (!stream) return;
@@ -1047,23 +1017,13 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
   };
 
   const cleanup = () => {
-    console.log("Cleaning up call hardware and signaling...");
-    unsubscribes.current.forEach(unsub => unsub());
-    unsubscribes.current = [];
-    
-    if (ringtoneRef.current) {
-      ringtoneRef.current.pause();
-      ringtoneRef.current = null;
-    }
-
+    console.log("Cleaning up hardware...");
     stopAllTracks(streamRef.current);
     streamRef.current = null;
 
     if (pc.current) {
       pc.current.ontrack = null;
       pc.current.onicecandidate = null;
-      pc.current.oniceconnectionstatechange = null;
-      pc.current.onsignalingstatechange = null;
       if (pc.current.signalingState !== 'closed') {
         pc.current.close();
       }
@@ -1072,27 +1032,12 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
 
     setLocalStream(null);
     setRemoteStream(null);
-    setIsConnecting(true);
     isInitialized.current = false;
+    isHandshakeDone.current = false;
     iceBuffer.current = [];
   };
 
-  const drainIceBuffer = async () => {
-    if (!pc.current || !pc.current.remoteDescription || pc.current.signalingState !== 'stable') return;
-    console.log("Draining ICE buffer, size:", iceBuffer.current.length);
-    while (iceBuffer.current.length > 0) {
-      const candidate = iceBuffer.current.shift();
-      if (candidate) {
-        try {
-          await pc.current.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (e) {
-          console.warn("Failed to apply buffered ICE candidate", e);
-        }
-      }
-    }
-  };
-
-  // Monitor Call Document
+  // 1. Initial Call State & Termination Watcher
   useEffect(() => {
     if (!db || !callId || !user) return;
 
@@ -1100,16 +1045,6 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
       const data = snapshot.data();
       if (!data) return;
       setCallData(data);
-
-      if (data.status === "ringing" && data.callerId === user.uid && !ringtoneRef.current) {
-        const audio = new Audio("https://assets.mixkit.co/active_storage/sfx/2358/2358-preview.mp3");
-        audio.loop = true;
-        audio.play().catch(() => {});
-        ringtoneRef.current = audio;
-      } else if (data.status !== "ringing" && ringtoneRef.current) {
-        ringtoneRef.current.pause();
-        ringtoneRef.current = null;
-      }
 
       if (data.status === "active" && !callStartTime) {
         setCallStartTime(Date.now());
@@ -1121,154 +1056,120 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
       }
     });
 
-    unsubscribes.current.push(unsubDoc);
-    return () => cleanup();
+    return () => {
+      cleanup();
+    };
   }, [db, callId, user]);
 
-  // Handle Hardware Initialization on User Gesture
-  const initializeHardware = async () => {
-    if (!callData || !user || !db || isInitialized.current) return;
-    
-    isInitialized.current = true;
-    try {
-      console.log("Requesting hardware access...");
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: callData.type === "video" ? {
-          facingMode: "user",
-          width: { ideal: 640 },
-          height: { ideal: 480 }
-        } : false,
-        audio: true
-      });
-      
-      setLocalStream(stream);
-      streamRef.current = stream;
-      setIsHardwareStarted(true);
-
-      const peerConnection = new RTCPeerConnection(servers);
-      pc.current = peerConnection;
-
-      stream.getTracks().forEach((track) => peerConnection.addTrack(track, stream));
-
-      peerConnection.ontrack = (event) => {
-        console.log("Remote track detected");
-        if (event.streams && event.streams[0]) {
-          setRemoteStream(event.streams[0]);
-          setIsConnecting(false);
-        }
-      };
-
-      peerConnection.onicecandidate = (event) => {
-        if (event.candidate && pc.current && pc.current.signalingState !== 'closed') {
-          const collectionName = callData.callerId === user.uid ? "callerCandidates" : "calleeCandidates";
-          addDoc(collection(db, "calls", callId, collectionName), event.candidate.toJSON());
-        }
-      };
-
-      peerConnection.onsignalingstatechange = () => {
-        if (peerConnection.signalingState === 'stable') {
-          drainIceBuffer();
-        }
-      };
-
-      peerConnection.oniceconnectionstatechange = () => {
-        console.log("ICE State:", peerConnection.iceConnectionState);
-        if (peerConnection.iceConnectionState === 'connected' || peerConnection.iceConnectionState === 'completed') {
-          setIsConnecting(false);
-        }
-      };
-
-      // Listen for candidates from the OTHER person
-      const remoteCandPath = callData.callerId === user.uid ? "calleeCandidates" : "callerCandidates";
-      const unsubCand = onSnapshot(collection(db, "calls", callId, remoteCandPath), (snapshot) => {
-        snapshot.docChanges().forEach(async (change) => {
-          if (change.type === 'added') {
-            const candidate = change.doc.data() as RTCIceCandidateInit;
-            if (pc.current?.remoteDescription && pc.current.signalingState === 'stable') {
-              try {
-                await pc.current.addIceCandidate(new RTCIceCandidate(candidate));
-              } catch (e) {
-                console.warn("ICE candidate error", e);
-              }
-            } else {
-              iceBuffer.current.push(candidate);
-            }
-          }
-        });
-      });
-      unsubscribes.current.push(unsubCand);
-
-      // Handshake: Caller creates offer
-      if (callData.callerId === user.uid && !callData.offer) {
-        const offer = await peerConnection.createOffer();
-        await peerConnection.setLocalDescription(offer);
-        await updateDoc(doc(db, "calls", callId), { offer: { sdp: offer.sdp, type: offer.type } });
-      }
-    } catch (e: any) {
-      console.error("Call Setup Failure:", e);
-      setPermissionError(true);
-      toast({ variant: "destructive", title: "Hardware Restricted", description: "Identity check failed: Camera/Mic blocked." });
-    }
-  };
-
-  // Handshake: Callee processes offer / Caller processes answer
+  // 2. Hardware & Signaling Initialization
   useEffect(() => {
-    if (!pc.current || !callData || !user || !isHardwareStarted) return;
+    if (!callData || !db || !user || isInitialized.current) return;
     
-    const syncSignaling = async () => {
-      const p = pc.current;
-      if (!p || p.signalingState === 'closed') return;
+    const init = async () => {
+      isInitialized.current = true;
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: callData.type === "video" ? { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } } : false,
+          audio: true
+        });
+        
+        setLocalStream(stream);
+        streamRef.current = stream;
 
-      // CALLEE: Process incoming offer
-      if (user.uid === callData.calleeId && callData.offer && p.signalingState === 'stable') {
-        try {
-          console.log("Callee: Applying offer...");
-          await p.setRemoteDescription(new RTCSessionDescription(callData.offer));
-          await drainIceBuffer();
-          const answer = await p.createAnswer();
-          await p.setLocalDescription(answer);
-          await updateDoc(doc(db, "calls", callId), { 
-            answer: { type: answer.type, sdp: answer.sdp },
-            status: "active" 
+        const peerConnection = new RTCPeerConnection(servers);
+        pc.current = peerConnection;
+
+        stream.getTracks().forEach((track) => peerConnection.addTrack(track, stream));
+
+        peerConnection.ontrack = (event) => {
+          if (event.streams && event.streams[0]) {
+            setRemoteStream(event.streams[0]);
+            setIsConnecting(false);
+          }
+        };
+
+        peerConnection.onicecandidate = (event) => {
+          if (event.candidate && pc.current && pc.current.signalingState !== 'closed') {
+            const collectionName = callData.callerId === user.uid ? "callerCandidates" : "calleeCandidates";
+            addDoc(collection(db, "calls", callId, collectionName), event.candidate.toJSON());
+          }
+        };
+
+        // Listen for candidates
+        const remoteCandPath = callData.callerId === user.uid ? "calleeCandidates" : "callerCandidates";
+        onSnapshot(collection(db, "calls", callId, remoteCandPath), (snapshot) => {
+          snapshot.docChanges().forEach(async (change) => {
+            if (change.type === 'added') {
+              const candidate = change.doc.data() as RTCIceCandidateInit;
+              if (pc.current?.remoteDescription && pc.current.signalingState === 'stable') {
+                await pc.current.addIceCandidate(new RTCIceCandidate(candidate));
+              } else {
+                iceBuffer.current.push(candidate);
+              }
+            }
           });
-        } catch (e) {
-          console.error("Signaling error (callee)", e);
+        });
+
+        // Handshake: Caller creates offer
+        if (callData.callerId === user.uid && !callData.offer) {
+          const offer = await peerConnection.createOffer();
+          await peerConnection.setLocalDescription(offer);
+          await updateDoc(doc(db, "calls", callId), { offer: { sdp: offer.sdp, type: offer.type } });
         }
+      } catch (e) {
+        setPermissionError(true);
+        toast({ variant: "destructive", title: "Hardware Blocked", description: "Camera or Mic access was denied." });
+      }
+    };
+
+    init();
+  }, [callData, db, user]);
+
+  // 3. Handshake Synchronization
+  useEffect(() => {
+    if (!pc.current || !callData || !user || isHandshakeDone.current) return;
+
+    const sync = async () => {
+      const p = pc.current!;
+      
+      // Callee processes offer
+      if (user.uid === callData.calleeId && callData.offer && p.signalingState === 'stable') {
+        isHandshakeDone.current = true;
+        await p.setRemoteDescription(new RTCSessionDescription(callData.offer));
+        while (iceBuffer.current.length) {
+          await p.addIceCandidate(new RTCIceCandidate(iceBuffer.current.shift()!));
+        }
+        const answer = await p.createAnswer();
+        await p.setLocalDescription(answer);
+        await updateDoc(doc(db, "calls", callId), { answer: { sdp: answer.sdp, type: answer.type }, status: "active" });
       }
 
-      // CALLER: Process incoming answer
+      // Caller processes answer
       if (user.uid === callData.callerId && callData.answer && p.signalingState === 'have-local-offer') {
-        try {
-          console.log("Caller: Applying answer...");
-          await p.setRemoteDescription(new RTCSessionDescription(callData.answer));
-          await drainIceBuffer();
-        } catch (e) {
-          console.error("Signaling error (caller)", e);
+        isHandshakeDone.current = true;
+        await p.setRemoteDescription(new RTCSessionDescription(callData.answer));
+        while (iceBuffer.current.length) {
+          await p.addIceCandidate(new RTCIceCandidate(iceBuffer.current.shift()!));
         }
       }
     };
 
-    syncSignaling();
-  }, [callData, user, isHardwareStarted]);
+    sync();
+  }, [callData, user]);
 
-  // Video/Audio Element Sync
+  // 4. Video Element Sync
   useEffect(() => {
     if (localVideoRef.current && localStream) {
       localVideoRef.current.srcObject = localStream;
-      localVideoRef.current.play().catch(console.warn);
     }
   }, [localStream]);
 
   useEffect(() => {
     if (remoteStream) {
-      const videos = [remoteVideoRef.current, remoteAudioRef.current];
-      videos.forEach(el => {
+      [remoteVideoRef.current, remoteAudioRef.current].forEach(el => {
         if (el) {
           el.srcObject = remoteStream;
-          el.play().catch((err) => {
-            console.warn("Autoplay blocked:", err);
-            setNeedsAutoplayGesture(true);
-          });
+          el.play().catch(() => setNeedsAutoplayGesture(true));
         }
       });
     }
@@ -1289,98 +1190,43 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
 
   const endCall = async () => {
     if (!db || !callData) return;
-    const status = callStartTime ? "ended" : "missed";
+    const finalStatus = callStartTime ? "ended" : "missed";
     const finalDuration = duration;
     
-    try {
-      await updateDoc(doc(db, "calls", callId), { status });
-      const chatId = [callData.callerId, callData.calleeId].sort().join("_");
-      const logText = status === "missed" ? `Missed ${callData.type} call` : `${callData.type.toUpperCase()} call ended • ${finalDuration}`;
-      addDoc(collection(db, "chats", chatId, "messages"), { 
-        senderId: user?.uid, 
-        text: logText, 
-        timestamp: Date.now(), 
-        status: "sent" 
-      });
-    } catch (e) {}
+    await updateDoc(doc(db, "calls", callId), { status: finalStatus });
+    
+    const chatId = [callData.callerId, callData.calleeId].sort().join("_");
+    const logText = finalStatus === "missed" ? `Missed ${callData.type} call` : `${callData.type.toUpperCase()} call ended • ${finalDuration}`;
+    
+    addDoc(collection(db, "chats", chatId, "messages"), { 
+      senderId: user?.uid, 
+      text: logText, 
+      timestamp: Date.now(), 
+      status: "sent" 
+    });
     
     cleanup();
     onEnd();
   };
 
-  const toggleMute = () => {
-    if (streamRef.current) {
-      streamRef.current.getAudioTracks().forEach(track => track.enabled = !track.enabled);
-      setIsMuted(!isMuted);
-    }
-  };
-
-  const toggleVideo = () => {
-    if (streamRef.current) {
-      streamRef.current.getVideoTracks().forEach(track => track.enabled = !track.enabled);
-      setIsVideoOff(!isVideoOff);
-    }
-  };
-
-  const handleAutoplayFix = () => {
-    if (remoteVideoRef.current) remoteVideoRef.current.play();
-    if (remoteAudioRef.current) remoteAudioRef.current.play();
-    setNeedsAutoplayGesture(false);
-  };
-
-  if (!callData) return null;
-  const otherPersonName = callData.callerId === user?.uid ? callData.calleeName : callData.callerName;
-  const otherPersonPhoto = callData.callerId === user?.uid ? callData.calleePhoto : callData.callerPhoto;
+  const otherPersonName = callData?.callerId === user?.uid ? callData?.calleeName : callData?.callerName;
+  const otherPersonPhoto = callData?.callerId === user?.uid ? callData?.calleePhoto : callData?.callerPhoto;
 
   return (
     <div className="fixed inset-0 z-[10000] bg-slate-950 flex flex-col items-center justify-center animate-in fade-in duration-500 overflow-hidden">
       <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
       
-      {!isHardwareStarted && !permissionError && (
-        <div className="absolute inset-0 z-[10010] bg-slate-950 flex flex-col items-center justify-center p-8 text-center animate-in fade-in duration-500">
-          <Avatar className="h-24 w-24 mb-6 border-4 border-slate-800 shadow-2xl">
-            <AvatarImage src={otherPersonPhoto} />
-            <AvatarFallback className="bg-slate-900 text-white text-2xl font-black">{otherPersonName?.charAt(0)}</AvatarFallback>
-          </Avatar>
-          <h2 className="text-xl font-black text-white uppercase tracking-widest mb-2">{otherPersonName}</h2>
-          <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.4em] mb-12">Encrypted Link Ready</p>
-          <Button 
-            onClick={initializeHardware} 
-            className="w-full max-w-[280px] h-16 rounded-[2rem] bg-accent text-accent-foreground font-black uppercase tracking-widest text-xs shadow-2xl active:scale-95 transition-all"
-          >
-            <Wifi className="h-5 w-5 mr-3" />
-            Connect Secure Link
-          </Button>
-          <Button 
-            variant="ghost" 
-            onClick={endCall} 
-            className="mt-6 text-slate-500 hover:text-red-500 font-black uppercase text-[10px] tracking-widest"
-          >
-            Decline
-          </Button>
-        </div>
-      )}
-
       {needsAutoplayGesture && (
         <div className="absolute top-24 z-[10015] animate-in slide-in-from-top-4">
-          <Button 
-            onClick={handleAutoplayFix}
-            className="bg-accent text-accent-foreground rounded-full px-6 h-10 shadow-2xl border border-accent-foreground/20 font-black uppercase text-[10px] tracking-widest"
-          >
-            <Volume2 className="h-4 w-4 mr-2" />
-            Tap to Enable Audio
+          <Button onClick={() => { remoteVideoRef.current?.play(); remoteAudioRef.current?.play(); setNeedsAutoplayGesture(false); }} className="bg-accent text-accent-foreground rounded-full px-6 h-10 shadow-2xl font-black uppercase text-[10px] tracking-widest">
+            <Volume2 className="h-4 w-4 mr-2" /> Tap to Enable Audio
           </Button>
         </div>
       )}
 
       <div className="absolute inset-0 w-full h-full overflow-hidden flex items-center justify-center">
-        <video 
-          ref={remoteVideoRef} 
-          autoPlay 
-          playsInline 
-          className={`w-full h-full object-cover ${(callData.type !== "video" || !remoteStream) ? 'hidden' : ''}`} 
-        />
-        {(callData.type !== "video" || !remoteStream) && (
+        <video ref={remoteVideoRef} autoPlay playsInline className={`w-full h-full object-cover ${(callData?.type !== "video" || !remoteStream) ? 'hidden' : ''}`} />
+        {(callData?.type !== "video" || !remoteStream) && (
           <div className="flex flex-col items-center gap-6">
             <Avatar className="h-32 w-32 border-4 border-slate-800 shadow-2xl">
               <AvatarImage src={otherPersonPhoto} />
@@ -1388,23 +1234,14 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
             </Avatar>
             <div className="text-center space-y-2">
               <h2 className="text-2xl font-black text-white uppercase tracking-widest">{isConnecting ? "Establishing Link..." : otherPersonName}</h2>
-              <div className="flex items-center justify-center gap-2">
-                <div className={`h-1.5 w-1.5 rounded-full ${callStartTime ? 'bg-green-500 animate-pulse' : 'bg-yellow-500 animate-bounce'}`} />
-                <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.4em]">{callStartTime ? `Active: ${duration}` : "Handshake Pending"}</p>
-              </div>
+              <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.4em]">{callStartTime ? `Active: ${duration}` : "Handshake Pending"}</p>
             </div>
           </div>
         )}
       </div>
 
-      <div className={`absolute top-8 right-8 w-32 md:w-48 aspect-video bg-slate-900 rounded-2xl overflow-hidden border-2 border-slate-800 shadow-2xl z-20 ${callData.type !== "video" || !isHardwareStarted || permissionError ? 'hidden' : ''}`}>
-        <video 
-          ref={localVideoRef} 
-          autoPlay 
-          muted 
-          playsInline 
-          className={`w-full h-full object-cover ${isVideoOff ? 'hidden' : ''}`} 
-        />
+      <div className={`absolute top-8 right-8 w-32 md:w-48 aspect-video bg-slate-900 rounded-2xl overflow-hidden border-2 border-slate-800 shadow-2xl z-20 ${callData?.type !== "video" ? 'hidden' : ''}`}>
+        <video ref={localVideoRef} autoPlay muted playsInline className={`w-full h-full object-cover ${isVideoOff ? 'hidden' : ''}`} />
         {isVideoOff && <div className="w-full h-full flex items-center justify-center bg-slate-900"><VideoOff className="h-6 w-6 text-slate-700" /></div>}
       </div>
 
@@ -1412,28 +1249,23 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
         <div className="absolute inset-0 z-50 bg-slate-950/90 backdrop-blur-md flex flex-col items-center justify-center p-8 text-center">
           <ShieldAlert className="h-16 w-16 text-red-500 mb-6" />
           <h3 className="text-xl font-black text-white uppercase mb-2">Hardware Restricted</h3>
-          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-8 leading-relaxed max-w-xs">
-            Identity check failed: Camera or microphone access was denied by the OS or browser.
-          </p>
           <Button onClick={endCall} variant="destructive" className="rounded-2xl px-12 h-14 font-black uppercase tracking-widest">Close Terminal</Button>
         </div>
       )}
 
-      {isHardwareStarted && (
-        <div className="absolute bottom-12 flex items-center gap-6 z-[100] animate-in slide-in-from-bottom-8 duration-700">
-          <button onClick={toggleMute} className={`h-14 w-14 rounded-2xl flex items-center justify-center transition-all ${isMuted ? 'bg-red-500 text-white' : 'bg-slate-900/50 text-white hover:bg-slate-800'}`}>
-            {isMuted ? <MicOff className="h-6 w-6" /> : <Mic className="h-6 w-6" />}
+      <div className="absolute bottom-12 flex items-center gap-6 z-[100] animate-in slide-in-from-bottom-8 duration-700">
+        <button onClick={() => { if(streamRef.current) { streamRef.current.getAudioTracks().forEach(t => t.enabled = !t.enabled); setIsMuted(!isMuted); }}} className={`h-14 w-14 rounded-2xl flex items-center justify-center transition-all ${isMuted ? 'bg-red-500' : 'bg-slate-900/50 hover:bg-slate-800'}`}>
+          {isMuted ? <MicOff className="h-6 w-6 text-white" /> : <Mic className="h-6 w-6 text-white" />}
+        </button>
+        <button onClick={endCall} className="h-18 w-18 rounded-3xl bg-red-600 hover:bg-red-700 text-white shadow-2xl active:scale-90 transition-all flex items-center justify-center">
+          <PhoneOff className="h-8 w-8" />
+        </button>
+        {callData?.type === "video" && (
+          <button onClick={() => { if(streamRef.current) { streamRef.current.getVideoTracks().forEach(t => t.enabled = !t.enabled); setIsVideoOff(!isVideoOff); }}} className={`h-14 w-14 rounded-2xl flex items-center justify-center transition-all ${isVideoOff ? 'bg-red-500' : 'bg-slate-900/50 hover:bg-slate-800'}`}>
+            {isVideoOff ? <VideoOff className="h-6 w-6 text-white" /> : <Video className="h-6 w-6 text-white" />}
           </button>
-          <button onClick={endCall} className="h-18 w-18 rounded-3xl bg-red-600 hover:bg-red-700 text-white shadow-2xl active:scale-90 transition-all flex items-center justify-center">
-            <PhoneOff className="h-8 w-8" />
-          </button>
-          {callData.type === "video" && (
-            <button onClick={toggleVideo} className={`h-14 w-14 rounded-2xl flex items-center justify-center transition-all ${isVideoOff ? 'bg-red-500 text-white' : 'bg-slate-900/50 text-white hover:bg-slate-800'}`}>
-              {isVideoOff ? <VideoOff className="h-6 w-6" /> : <Video className="h-6 w-6" />}
-            </button>
-          )}
-        </div>
-      )}
+        )}
+      </div>
 
       <div className="absolute top-8 left-1/2 -translate-x-1/2 bg-slate-900/80 backdrop-blur-md px-4 py-1.5 rounded-full border border-slate-800/50 flex items-center gap-2">
         <Clock className="h-3 w-3 text-slate-400" />

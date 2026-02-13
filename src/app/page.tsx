@@ -1552,10 +1552,6 @@ export default function Home() {
             callId={activeCallId} 
             onEnd={() => {
               setActiveCallId(null);
-              if (incomingRingtoneRef.current) {
-                incomingRingtoneRef.current.pause();
-                incomingRingtoneRef.current = null;
-              }
             }} 
           />
         )}
