@@ -1009,30 +1009,34 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const remoteAudioRef = useRef<HTMLAudioElement>(null);
-  const soundRef = useRef<HTMLAudioElement | null>(null);
+  const ringtoneRef = useRef<HTMLAudioElement | null>(null);
   
   const pc = useRef<RTCPeerConnection | null>(null);
-  const localStreamRef = useRef<MediaStream | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
   const iceBuffer = useRef<RTCIceCandidateInit[]>([]);
-  const setupStarted = useRef(false);
+  const isInitialized = useRef(false);
   const unsubscribes = useRef<(() => void)[]>([]);
 
+  const stopAllTracks = (stream: MediaStream | null) => {
+    if (!stream) return;
+    stream.getTracks().forEach(track => {
+      track.enabled = false;
+      track.stop();
+    });
+  };
+
   const cleanup = () => {
+    console.log("Cleaning up call hardware and signaling...");
     unsubscribes.current.forEach(unsub => unsub());
     unsubscribes.current = [];
     
-    if (soundRef.current) {
-      soundRef.current.pause();
-      soundRef.current = null;
+    if (ringtoneRef.current) {
+      ringtoneRef.current.pause();
+      ringtoneRef.current = null;
     }
 
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach(track => {
-        track.enabled = false;
-        track.stop();
-      });
-      localStreamRef.current = null;
-    }
+    stopAllTracks(streamRef.current);
+    streamRef.current = null;
 
     if (pc.current) {
       pc.current.ontrack = null;
@@ -1048,15 +1052,8 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
     setLocalStream(null);
     setRemoteStream(null);
     setIsConnecting(true);
-    setupStarted.current = false;
+    isInitialized.current = false;
     iceBuffer.current = [];
-  };
-
-  const formatDuration = (ms: number) => {
-    const totalSeconds = Math.floor(ms / 1000);
-    const mins = Math.floor(totalSeconds / 60);
-    const secs = totalSeconds % 60;
-    return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
   const drainIceBuffer = async () => {
@@ -1068,12 +1065,13 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
         try {
           await pc.current.addIceCandidate(new RTCIceCandidate(candidate));
         } catch (e) {
-          console.warn("Failed to add buffered ICE candidate", e);
+          console.warn("Failed to apply buffered ICE candidate", e);
         }
       }
     }
   };
 
+  // Monitor Call Document
   useEffect(() => {
     if (!db || !callId || !user) return;
 
@@ -1082,14 +1080,14 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
       if (!data) return;
       setCallData(data);
 
-      if (data.status === "ringing" && data.callerId === user.uid && !soundRef.current) {
+      if (data.status === "ringing" && data.callerId === user.uid && !ringtoneRef.current) {
         const audio = new Audio("https://assets.mixkit.co/active_storage/sfx/2358/2358-preview.mp3");
         audio.loop = true;
         audio.play().catch(() => {});
-        soundRef.current = audio;
-      } else if (data.status !== "ringing" && soundRef.current) {
-        soundRef.current.pause();
-        soundRef.current = null;
+        ringtoneRef.current = audio;
+      } else if (data.status !== "ringing" && ringtoneRef.current) {
+        ringtoneRef.current.pause();
+        ringtoneRef.current = null;
       }
 
       if (data.status === "active" && !callStartTime) {
@@ -1106,123 +1104,125 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
     return () => cleanup();
   }, [db, callId, user]);
 
+  // Main Handshake & Media Logic
   useEffect(() => {
-    if (callData && !setupStarted.current) {
-      setupStarted.current = true;
-      initializeMediaAndConnection();
-    }
-  }, [callData]);
-
-  const initializeMediaAndConnection = async () => {
-    if (pc.current || !callData) return;
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: callData.type === "video" ? {
-          facingMode: "user",
-          width: { ideal: 640 },
-          height: { ideal: 480 }
-        } : false,
-        audio: true
-      });
-      
-      setLocalStream(stream);
-      localStreamRef.current = stream;
-
-      const peerConnection = new RTCPeerConnection(servers);
-      pc.current = peerConnection;
-
-      stream.getTracks().forEach((track) => peerConnection.addTrack(track, stream));
-
-      peerConnection.ontrack = (event) => {
-        console.log("Remote track received");
-        if (event.streams && event.streams[0]) {
-          setRemoteStream(event.streams[0]);
-          setIsConnecting(false);
-        }
-      };
-
-      peerConnection.onicecandidate = (event) => {
-        if (event.candidate && pc.current && pc.current.signalingState !== 'closed') {
-          const collectionName = callData.callerId === user?.uid ? "callerCandidates" : "calleeCandidates";
-          addDoc(collection(db, "calls", callId, collectionName), event.candidate.toJSON());
-        }
-      };
-
-      peerConnection.oniceconnectionstatechange = () => {
-        console.log("ICE Connection State:", peerConnection.iceConnectionState);
-        if (peerConnection.iceConnectionState === 'connected') {
-          setIsConnecting(false);
-        }
-      };
-
-      const candidatesPath = callData.callerId === user?.uid ? "calleeCandidates" : "callerCandidates";
-      const unsubCandidates = onSnapshot(collection(db, "calls", callId, candidatesPath), (snapshot) => {
-        snapshot.docChanges().forEach(async (change) => {
-          if (change.type === 'added' && pc.current && pc.current.signalingState !== 'closed') {
-            const candidate = change.doc.data() as RTCIceCandidateInit;
-            if (pc.current?.remoteDescription) {
-              try { 
-                await pc.current.addIceCandidate(new RTCIceCandidate(candidate)); 
-              } catch (e) {
-                console.warn("Error adding ICE candidate", e);
-              }
-            } else {
-              iceBuffer.current.push(candidate);
-            }
-          }
+    if (!callData || !user || !db || isInitialized.current) return;
+    
+    const initialize = async () => {
+      isInitialized.current = true;
+      try {
+        console.log("Requesting hardware access...");
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: callData.type === "video" ? {
+            facingMode: "user",
+            width: { ideal: 640 },
+            height: { ideal: 480 }
+          } : false,
+          audio: true
         });
-      });
-      unsubscribes.current.push(unsubCandidates);
+        
+        setLocalStream(stream);
+        streamRef.current = stream;
 
-      if (callData.callerId === user?.uid) {
-        const offer = await peerConnection.createOffer();
-        await peerConnection.setLocalDescription(offer);
-        await updateDoc(doc(db, "calls", callId), { offer: { sdp: offer.sdp, type: offer.type } });
+        const peerConnection = new RTCPeerConnection(servers);
+        pc.current = peerConnection;
+
+        stream.getTracks().forEach((track) => peerConnection.addTrack(track, stream));
+
+        peerConnection.ontrack = (event) => {
+          console.log("Remote track detected");
+          if (event.streams && event.streams[0]) {
+            setRemoteStream(event.streams[0]);
+            setIsConnecting(false);
+          }
+        };
+
+        peerConnection.onicecandidate = (event) => {
+          if (event.candidate && pc.current && pc.current.signalingState !== 'closed') {
+            const collectionName = callData.callerId === user.uid ? "callerCandidates" : "calleeCandidates";
+            addDoc(collection(db, "calls", callId, collectionName), event.candidate.toJSON());
+          }
+        };
+
+        peerConnection.oniceconnectionstatechange = () => {
+          console.log("ICE State:", peerConnection.iceConnectionState);
+          if (peerConnection.iceConnectionState === 'connected') setIsConnecting(false);
+        };
+
+        // Listen for candidates from the OTHER person
+        const remoteCandPath = callData.callerId === user.uid ? "calleeCandidates" : "callerCandidates";
+        const unsubCand = onSnapshot(collection(db, "calls", callId, remoteCandPath), (snapshot) => {
+          snapshot.docChanges().forEach(async (change) => {
+            if (change.type === 'added') {
+              const candidate = change.doc.data() as RTCIceCandidateInit;
+              if (pc.current?.remoteDescription) {
+                try {
+                  await pc.current.addIceCandidate(new RTCIceCandidate(candidate));
+                } catch (e) {
+                  console.warn("ICE candidate error", e);
+                }
+              } else {
+                iceBuffer.current.push(candidate);
+              }
+            }
+          });
+        });
+        unsubscribes.current.push(unsubCand);
+
+        // Handshake: Caller creates offer
+        if (callData.callerId === user.uid && !callData.offer) {
+          const offer = await peerConnection.createOffer();
+          await peerConnection.setLocalDescription(offer);
+          await updateDoc(doc(db, "calls", callId), { offer: { sdp: offer.sdp, type: offer.type } });
+        }
+      } catch (e: any) {
+        console.error("Call Setup Failure:", e);
+        setPermissionError(true);
+        toast({ variant: "destructive", title: "Hardware Restricted", description: "Identity check failed: Camera/Mic blocked." });
       }
-    } catch (e: any) {
-      console.error("Hardware Error:", e);
-      setPermissionError(true);
-      toast({ variant: "destructive", title: "Hardware Restricted", description: "Camera/Mic access denied." });
-    }
-  };
+    };
 
+    initialize();
+  }, [callData, user, db]);
+
+  // Handshake: Callee processes offer / Caller processes answer
   useEffect(() => {
     if (!pc.current || !callData || !user) return;
     
-    const processSignaling = async () => {
-      const peerConnection = pc.current;
-      if (!peerConnection || peerConnection.signalingState === 'closed') return;
+    const syncSignaling = async () => {
+      const p = pc.current;
+      if (!p || p.signalingState === 'closed') return;
 
-      // CALLEE PROCESSES OFFER
-      if (callData.offer && user.uid === callData.calleeId && peerConnection.signalingState === 'stable') {
-        console.log("Processing offer as callee");
+      // CALLEE: Process incoming offer
+      if (user.uid === callData.calleeId && callData.offer && p.signalingState === 'stable') {
         try {
-          await peerConnection.setRemoteDescription(new RTCSessionDescription(callData.offer));
+          console.log("Callee: Applying offer...");
+          await p.setRemoteDescription(new RTCSessionDescription(callData.offer));
           await drainIceBuffer();
-          const answer = await peerConnection.createAnswer();
-          await peerConnection.setLocalDescription(answer);
+          const answer = await p.createAnswer();
+          await p.setLocalDescription(answer);
           await updateDoc(doc(db, "calls", callId), { 
             answer: { type: answer.type, sdp: answer.sdp },
             status: "active" 
           });
         } catch (e) {
-          console.error("Error during callee handshake", e);
+          console.error("Signaling error (callee)", e);
         }
       }
 
-      // CALLER PROCESSES ANSWER
-      if (callData.answer && user.uid === callData.callerId && peerConnection.signalingState === 'have-local-offer') {
-        console.log("Processing answer as caller");
+      // CALLER: Process incoming answer
+      if (user.uid === callData.callerId && callData.answer && p.signalingState === 'have-local-offer') {
         try {
-          await peerConnection.setRemoteDescription(new RTCSessionDescription(callData.answer));
+          console.log("Caller: Applying answer...");
+          await p.setRemoteDescription(new RTCSessionDescription(callData.answer));
           await drainIceBuffer();
         } catch (e) {
-          console.error("Error during caller handshake", e);
+          console.error("Signaling error (caller)", e);
         }
       }
     };
-    
-    processSignaling();
+
+    syncSignaling();
   }, [callData, user]);
 
   useEffect(() => {
@@ -1239,7 +1239,12 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
   useEffect(() => {
     let interval: any;
     if (callStartTime) {
-      interval = setInterval(() => setDuration(formatDuration(Date.now() - callStartTime)), 1000);
+      interval = setInterval(() => {
+        const diff = Date.now() - callStartTime;
+        const mins = Math.floor(diff / 60000);
+        const secs = Math.floor((diff % 60000) / 1000);
+        setDuration(`${mins}:${secs.toString().padStart(2, '0')}`);
+      }, 1000);
     }
     return () => clearInterval(interval);
   }, [callStartTime]);
@@ -1266,15 +1271,15 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
   };
 
   const toggleMute = () => {
-    if (localStreamRef.current) {
-      localStreamRef.current.getAudioTracks().forEach(track => track.enabled = !track.enabled);
+    if (streamRef.current) {
+      streamRef.current.getAudioTracks().forEach(track => track.enabled = !track.enabled);
       setIsMuted(!isMuted);
     }
   };
 
   const toggleVideo = () => {
-    if (localStreamRef.current) {
-      localStreamRef.current.getVideoTracks().forEach(track => track.enabled = !track.enabled);
+    if (streamRef.current) {
+      streamRef.current.getVideoTracks().forEach(track => track.enabled = !track.enabled);
       setIsVideoOff(!isVideoOff);
     }
   };
