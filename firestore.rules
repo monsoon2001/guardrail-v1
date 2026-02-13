@@ -1,0 +1,60 @@
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() { return request.auth != null; }
+    function isOwner(userId) { return isSignedIn() && request.auth.uid == userId; }
+
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow create, update: if isOwner(userId);
+      allow delete: if isOwner(userId);
+    }
+    
+    match /users {
+      allow list: if isSignedIn();
+    }
+
+    match /requests/{requestId} {
+      allow create: if isSignedIn();
+      allow list: if isSignedIn();
+      allow read, update, delete: if isSignedIn() && (
+        request.auth.uid == resource.data.fromId || 
+        request.auth.uid == resource.data.toId
+      );
+    }
+
+    match /chats/{chatId} {
+      function isParticipant() {
+        let parts = chatId.split('_');
+        return isSignedIn() && (parts[0] == request.auth.uid || parts[1] == request.auth.uid);
+      }
+      
+      allow get: if isParticipant();
+
+      match /messages/{messageId} {
+        allow get, list, create: if isParticipant();
+        allow update: if isParticipant() && (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        );
+      }
+    }
+
+    match /calls/{callId} {
+      allow create: if isSignedIn();
+      allow list: if isSignedIn();
+      allow read, update, delete: if isSignedIn() && (
+        request.auth.uid == resource.data.callerId || 
+        request.auth.uid == resource.data.calleeId
+      );
+      
+      // Specifically allow signaling subcollections for WebRTC
+      match /callerCandidates/{candId} {
+        allow list, read, write: if isSignedIn();
+      }
+      match /calleeCandidates/{candId} {
+        allow list, read, write: if isSignedIn();
+      }
+    }
+  }
+}

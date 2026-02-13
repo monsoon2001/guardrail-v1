@@ -1,0 +1,94 @@
+
+{
+  "entities": {
+    "UserProfile": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "UserProfile",
+      "type": "object",
+      "description": "Represents a user's profile within the Guardrail app.",
+      "properties": {
+        "id": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "guardrailId": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "batteryLevel": { "type": "number" },
+        "isOnline": { "type": "boolean" },
+        "biometricEnabled": { "type": "boolean" },
+        "lastLocation": {
+          "type": "object",
+          "properties": {
+            "lat": { "type": "number" },
+            "lng": { "type": "number" },
+            "timestamp": { "type": "number" }
+          }
+        }
+      },
+      "required": ["id", "email", "guardrailId", "createdAt"]
+    },
+    "ContactRequest": {
+      "title": "ContactRequest",
+      "type": "object",
+      "properties": {
+        "fromId": { "type": "string" },
+        "fromName": { "type": "string" },
+        "fromPhoto": { "type": "string" },
+        "toId": { "type": "string" },
+        "toGuardrailId": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "accepted", "rejected"] },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["fromId", "toId", "status", "timestamp"]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "type": "object",
+      "properties": {
+        "senderId": { "type": "string" },
+        "text": { "type": "string" },
+        "timestamp": { "type": "number" },
+        "status": { "type": "string", "enum": ["sent", "delivered", "seen"] }
+      },
+      "required": ["senderId", "text", "timestamp"]
+    },
+    "CallSession": {
+      "title": "CallSession",
+      "type": "object",
+      "properties": {
+        "callerId": { "type": "string" },
+        "callerName": { "type": "string" },
+        "callerPhoto": { "type": "string" },
+        "calleeId": { "type": "string" },
+        "type": { "type": "string", "enum": ["audio", "video"] },
+        "status": { "type": "string", "enum": ["ringing", "active", "ended", "missed"] },
+        "timestamp": { "type": "number" },
+        "offer": { "type": "object" },
+        "answer": { "type": "object" }
+      },
+      "required": ["callerId", "calleeId", "type", "status", "timestamp"]
+    }
+  },
+  "auth": {
+    "providers": ["google.com"]
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/backend/entities/UserProfile" },
+      "description": "User profiles"
+    },
+    "/requests/{requestId}": {
+      "schema": { "$ref": "#/backend/entities/ContactRequest" },
+      "description": "Contact requests between users"
+    },
+    "/chats/{chatId}/messages/{messageId}": {
+      "schema": { "$ref": "#/backend/entities/ChatMessage" },
+      "description": "Real-time messages between contacts"
+    },
+    "/calls/{callId}": {
+      "schema": { "$ref": "#/backend/entities/CallSession" },
+      "description": "Real-time call signaling sessions"
+    }
+  }
+}
