@@ -1084,7 +1084,6 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
     return `${minutes}:${seconds.toString().padStart(2, '0')}`;
   };
 
-  // Helper to drain ICE buffer once remote description is set
   const drainIceBuffer = async () => {
     if (!pc.current || !pc.current.remoteDescription) return;
     while (iceBuffer.current.length > 0) {
@@ -1120,19 +1119,16 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
         if (!data) return;
         setCallData(data);
 
-        // Sound Management
         if (data.status === "ringing" && data.callerId === user?.uid) {
           playSound("https://assets.mixkit.co/active_storage/sfx/2358/2358-preview.mp3");
         } else {
           stopSound();
         }
 
-        // Timeout for missed calls
         if (data.status === "ringing" && data.callerId === user?.uid && !timeoutRef.current) {
           timeoutRef.current = setTimeout(() => logCallStatus("missed"), 35000);
         }
 
-        // Active Call Duration Tracking
         if (data.status === "active" && !callStartTime) {
           const start = Date.now();
           setCallStartTime(start);
@@ -1143,9 +1139,7 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
           }, 1000);
         }
 
-        // Signaling logic
         if (pc.current) {
-          // CALLEE receives offer
           if (data.offer && data.calleeId === user?.uid && pc.current.signalingState === 'stable') {
             try {
               await pc.current.setRemoteDescription(new RTCSessionDescription(data.offer));
@@ -1161,7 +1155,6 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
             }
           }
 
-          // CALLER receives answer
           if (data.answer && data.callerId === user?.uid && pc.current.signalingState === 'have-local-offer') {
             try {
               await pc.current.setRemoteDescription(new RTCSessionDescription(data.answer));
@@ -1198,7 +1191,6 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
     if (pc.current || !callData) return;
 
     try {
-      // Use more flexible constraints for mobile hardware compatibility
       const stream = await navigator.mediaDevices.getUserMedia({
         video: callData.type === "video" ? {
           facingMode: "user",
@@ -1235,7 +1227,6 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
 
       setIsConnecting(false);
 
-      // Listen for remote ICE candidates
       const candidatesPath = callData.callerId === user?.uid ? "calleeCandidates" : "callerCandidates";
       const unsubCandidates = onSnapshot(collection(db, "calls", callId, candidatesPath), (snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
@@ -1253,7 +1244,6 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
       });
       unsubscribes.current.push(unsubCandidates);
 
-      // Initial Offer Creation (Caller Only)
       if (callData.callerId === user?.uid && peerConnection.signalingState === 'stable') {
         const offer = await peerConnection.createOffer();
         await peerConnection.setLocalDescription(offer);
