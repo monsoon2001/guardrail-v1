@@ -958,6 +958,7 @@ import {
   updateDoc, 
   collection, 
   addDoc, 
+  serverTimestamp
 } from "firebase/firestore";
 import { Button } from "@/components/ui/button";
 import { 
@@ -1016,72 +1017,51 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
   const remoteAudioRef = useRef<HTMLAudioElement>(null);
   const soundRef = useRef<HTMLAudioElement | null>(null);
   
-  const localStreamRef = useRef<MediaStream | null>(null);
-  const remoteStreamRef = useRef<MediaStream | null>(null);
   const pc = useRef<RTCPeerConnection | null>(null);
-  
-  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const durationIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const unsubscribes = useRef<(() => void)[]>([]);
-  const hasLoggedResult = useRef(false);
-  const setupAttempted = useRef(false);
-  
+  const localStreamRef = useRef<MediaStream | null>(null);
   const iceBuffer = useRef<RTCIceCandidateInit[]>([]);
+  const setupStarted = useRef(false);
+  const unsubscribes = useRef<(() => void)[]>([]);
 
-  const stopStream = (streamRef: React.MutableRefObject<MediaStream | null>) => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => {
-        track.enabled = false;
-        track.stop();
-      });
-      streamRef.current = null;
-    }
-  };
-
-  const stopSound = () => {
-    if (soundRef.current) {
-      soundRef.current.pause();
-      soundRef.current.currentTime = 0;
-      soundRef.current = null;
-    }
-  };
-
-  const playSound = (url: string) => {
-    if (soundRef.current) return;
-    const audio = new Audio(url);
-    audio.loop = true;
-    audio.play().catch(() => {});
-    soundRef.current = audio;
-  };
-
+  // Cleanup helper
   const cleanup = () => {
     unsubscribes.current.forEach(unsub => unsub());
     unsubscribes.current = [];
-    stopSound();
-    if (timeoutRef.current) clearTimeout(timeoutRef.current);
-    if (durationIntervalRef.current) clearInterval(durationIntervalRef.current);
     
-    stopStream(localStreamRef);
-    stopStream(remoteStreamRef);
-    setLocalStream(null);
-    setRemoteStream(null);
+    if (soundRef.current) {
+      soundRef.current.pause();
+      soundRef.current = null;
+    }
 
-    if (localVideoRef.current) localVideoRef.current.srcObject = null;
-    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
-    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => {
+        track.enabled = false;
+        track.stop();
+      });
+      localStreamRef.current = null;
+    }
 
     if (pc.current) {
-      if (pc.current.signalingState !== 'closed') pc.current.close();
+      pc.current.ontrack = null;
+      pc.current.onicecandidate = null;
+      pc.current.oniceconnectionstatechange = null;
+      pc.current.onsignalingstatechange = null;
+      if (pc.current.signalingState !== 'closed') {
+        pc.current.close();
+      }
       pc.current = null;
     }
-    iceBuffer.current = [];
+
+    setLocalStream(null);
+    setRemoteStream(null);
+    setIsConnecting(false);
   };
 
   const formatDuration = (ms: number) => {
     const totalSeconds = Math.floor(ms / 1000);
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
-    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+    const mins = Math.floor(totalSeconds / 60);
+    const secs = totalSeconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
   const drainIceBuffer = async () => {
@@ -1099,90 +1079,69 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
   };
 
   useEffect(() => {
-    if (localVideoRef.current && localStream) localVideoRef.current.srcObject = localStream;
-  }, [localStream]);
+    if (!db || !callId || !user) return;
 
-  useEffect(() => {
-    if (remoteStream) {
-      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = remoteStream;
-      if (remoteAudioRef.current) remoteAudioRef.current.srcObject = remoteStream;
-    }
-  }, [remoteStream]);
+    // Listen to call document for status and signaling
+    const unsubDoc = onSnapshot(doc(db, "calls", callId), async (snapshot) => {
+      const data = snapshot.data();
+      if (!data) return;
+      setCallData(data);
 
-  useEffect(() => {
-    if (!db || !callId) return;
-
-    const unsubscribe = onSnapshot(
-      doc(db, "calls", callId), 
-      async (snapshot) => {
-        const data = snapshot.data();
-        if (!data) return;
-        setCallData(data);
-
-        if (data.status === "ringing" && data.callerId === user?.uid) {
-          playSound("https://assets.mixkit.co/active_storage/sfx/2358/2358-preview.mp3");
-        } else {
-          stopSound();
-        }
-
-        if (data.status === "ringing" && data.callerId === user?.uid && !timeoutRef.current) {
-          timeoutRef.current = setTimeout(() => logCallStatus("missed"), 35000);
-        }
-
-        if (data.status === "active" && !callStartTime) {
-          const start = Date.now();
-          setCallStartTime(start);
-          if (timeoutRef.current) clearTimeout(timeoutRef.current);
-          if (durationIntervalRef.current) clearInterval(durationIntervalRef.current);
-          durationIntervalRef.current = setInterval(() => {
-            setDuration(formatDuration(Date.now() - start));
-          }, 1000);
-        }
-
-        if (pc.current) {
-          if (data.offer && data.calleeId === user?.uid && pc.current.signalingState === 'stable') {
-            try {
-              await pc.current.setRemoteDescription(new RTCSessionDescription(data.offer));
-              await drainIceBuffer();
-              const answer = await pc.current.createAnswer();
-              await pc.current.setLocalDescription(answer);
-              await updateDoc(doc(db, "calls", callId), { 
-                answer: { type: answer.type, sdp: answer.sdp },
-                status: "active"
-              });
-            } catch (e) {
-              console.error("Callee signaling error:", e);
-            }
-          }
-
-          if (data.answer && data.callerId === user?.uid && pc.current.signalingState === 'have-local-offer') {
-            try {
-              await pc.current.setRemoteDescription(new RTCSessionDescription(data.answer));
-              await drainIceBuffer();
-            } catch (e) {
-              console.error("Caller signaling error:", e);
-            }
-          }
-        }
-
-        if (data.status === "ended" || data.status === "missed") {
-          cleanup();
-          onEnd();
-        }
-      },
-      async (serverError) => {
-        const pError = new FirestorePermissionError({ path: `calls/${callId}`, operation: 'get' });
-        errorEmitter.emit('permission-error', pError);
+      if (data.status === "ringing" && data.callerId === user.uid && !soundRef.current) {
+        const audio = new Audio("https://assets.mixkit.co/active_storage/sfx/2358/2358-preview.mp3");
+        audio.loop = true;
+        audio.play().catch(() => {});
+        soundRef.current = audio;
+      } else if (data.status !== "ringing" && soundRef.current) {
+        soundRef.current.pause();
+        soundRef.current = null;
       }
-    );
 
-    unsubscribes.current.push(unsubscribe);
+      if (data.status === "active" && !callStartTime) {
+        setCallStartTime(Date.now());
+      }
+
+      // Signaling logic
+      if (pc.current && pc.current.signalingState !== 'closed') {
+        // Callee: process offer
+        if (data.offer && user.uid === data.calleeId && pc.current.signalingState === 'stable') {
+          try {
+            await pc.current.setRemoteDescription(new RTCSessionDescription(data.offer));
+            await drainIceBuffer();
+            const answer = await pc.current.createAnswer();
+            await pc.current.setLocalDescription(answer);
+            updateDoc(doc(db, "calls", callId), { 
+              answer: { type: answer.type, sdp: answer.sdp },
+              status: "active"
+            });
+          } catch (e) {
+            console.error("Callee error setting offer:", e);
+          }
+        }
+        // Caller: process answer
+        if (data.answer && user.uid === data.callerId && pc.current.signalingState === 'have-local-offer') {
+          try {
+            await pc.current.setRemoteDescription(new RTCSessionDescription(data.answer));
+            await drainIceBuffer();
+          } catch (e) {
+            console.error("Caller error setting answer:", e);
+          }
+        }
+      }
+
+      if (data.status === "ended" || data.status === "missed") {
+        cleanup();
+        onEnd();
+      }
+    });
+
+    unsubscribes.current.push(unsubDoc);
     return () => cleanup();
   }, [db, callId, user, callStartTime]);
 
   useEffect(() => {
-    if (callData && !setupAttempted.current) {
-      setupAttempted.current = true;
+    if (callData && !setupStarted.current) {
+      setupStarted.current = true;
       initializeMediaAndConnection();
     }
   }, [callData]);
@@ -1194,13 +1153,10 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: callData.type === "video" ? {
           facingMode: "user",
-          width: { ideal: 480 },
-          height: { ideal: 640 }
+          width: { ideal: 640 },
+          height: { ideal: 480 }
         } : false,
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true
-        }
+        audio: { echoCancellation: true, noiseSuppression: true }
       });
       
       setLocalStream(stream);
@@ -1214,7 +1170,6 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
       peerConnection.ontrack = (event) => {
         if (event.streams && event.streams[0]) {
           setRemoteStream(event.streams[0]);
-          remoteStreamRef.current = event.streams[0];
         }
       };
 
@@ -1225,8 +1180,13 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
         }
       };
 
-      setIsConnecting(false);
+      peerConnection.oniceconnectionstatechange = () => {
+        if (peerConnection.iceConnectionState === 'connected') {
+          setIsConnecting(false);
+        }
+      };
 
+      // Listen for incoming ICE candidates
       const candidatesPath = callData.callerId === user?.uid ? "calleeCandidates" : "callerCandidates";
       const unsubCandidates = onSnapshot(collection(db, "calls", callId, candidatesPath), (snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
@@ -1244,10 +1204,11 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
       });
       unsubscribes.current.push(unsubCandidates);
 
+      // Caller initiates
       if (callData.callerId === user?.uid && peerConnection.signalingState === 'stable') {
         const offer = await peerConnection.createOffer();
         await peerConnection.setLocalDescription(offer);
-        await updateDoc(doc(db, "calls", callId), { 
+        updateDoc(doc(db, "calls", callId), { 
           offer: { sdp: offer.sdp, type: offer.type } 
         });
       }
@@ -1257,15 +1218,38 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
     }
   };
 
-  const logCallStatus = async (status: "ended" | "missed") => {
-    if (!db || !callData || hasLoggedResult.current) return;
-    hasLoggedResult.current = true;
+  useEffect(() => {
+    if (localVideoRef.current && localStream) localVideoRef.current.srcObject = localStream;
+  }, [localStream]);
+
+  useEffect(() => {
+    if (remoteStream) {
+      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = remoteStream;
+      if (remoteAudioRef.current) remoteAudioRef.current.srcObject = remoteStream;
+      setIsConnecting(false);
+    }
+  }, [remoteStream]);
+
+  useEffect(() => {
+    let interval: any;
+    if (callStartTime) {
+      interval = setInterval(() => {
+        setDuration(formatDuration(Date.now() - callStartTime));
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [callStartTime]);
+
+  const endCall = async () => {
+    if (!db || !callData) return;
+    const status = callStartTime ? "ended" : "missed";
+    const finalDuration = callStartTime ? formatDuration(Date.now() - callStartTime) : "0:00";
+    
     try {
       await updateDoc(doc(db, "calls", callId), { status });
-      const finalDuration = callStartTime ? formatDuration(Date.now() - callStartTime) : "0:00";
-      const callTypeName = callData.type.charAt(0).toUpperCase() + callData.type.slice(1);
-      const logText = status === "missed" ? `Missed ${callData.type} call` : `${callTypeName} call ended • ${finalDuration}`;
       const chatId = [callData.callerId, callData.calleeId].sort().join("_");
+      const logText = status === "missed" ? `Missed ${callData.type} call` : `${callData.type.toUpperCase()} call ended • ${finalDuration}`;
+      
       await addDoc(collection(db, "chats", chatId, "messages"), {
         senderId: callData.callerId,
         text: logText,
@@ -1273,10 +1257,7 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
         status: "sent"
       });
     } catch (e) {}
-  };
-
-  const endCall = async () => {
-    await logCallStatus(callStartTime ? "ended" : "missed");
+    
     cleanup();
     onEnd();
   };
@@ -1321,12 +1302,12 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
             </Avatar>
             <div className="text-center space-y-2">
               <h2 className="text-2xl font-black text-white uppercase tracking-widest">
-                {isConnecting ? "Connecting..." : otherPersonName}
+                {isConnecting ? "Establishing Link..." : otherPersonName}
               </h2>
               <div className="flex items-center justify-center gap-2">
                 <div className={`h-1.5 w-1.5 rounded-full ${callStartTime ? 'bg-green-500 animate-pulse' : 'bg-yellow-500 animate-bounce'}`} />
                 <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.4em]">
-                  {callStartTime ? `Active: ${duration}` : "Establishing Link"}
+                  {callStartTime ? `Active: ${duration}` : "Handshake Pending"}
                 </p>
               </div>
             </div>
