@@ -958,7 +958,8 @@ import {
   updateDoc, 
   collection, 
   addDoc, 
-  serverTimestamp
+  serverTimestamp,
+  getDoc
 } from "firebase/firestore";
 import { Button } from "@/components/ui/button";
 import { 
@@ -979,9 +980,11 @@ const servers = {
   iceServers: [
     {
       urls: [
-        'stun:stun1.l.google.com:19302', 
-        'stun:stun2.l.google.com:19302',
         'stun:stun.l.google.com:19302',
+        'stun:stun1.l.google.com:19302',
+        'stun:stun2.l.google.com:19302',
+        'stun:stun3.l.google.com:19302',
+        'stun:stun4.l.google.com:19302',
       ],
     },
   ],
@@ -1044,7 +1047,9 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
 
     setLocalStream(null);
     setRemoteStream(null);
-    setIsConnecting(false);
+    setIsConnecting(true);
+    setupStarted.current = false;
+    iceBuffer.current = [];
   };
 
   const formatDuration = (ms: number) => {
@@ -1056,12 +1061,15 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
 
   const drainIceBuffer = async () => {
     if (!pc.current || !pc.current.remoteDescription) return;
+    console.log("Draining ICE buffer, size:", iceBuffer.current.length);
     while (iceBuffer.current.length > 0) {
       const candidate = iceBuffer.current.shift();
       if (candidate) {
         try {
           await pc.current.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (e) {}
+        } catch (e) {
+          console.warn("Failed to add buffered ICE candidate", e);
+        }
       }
     }
   };
@@ -1096,7 +1104,7 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
 
     unsubscribes.current.push(unsubDoc);
     return () => cleanup();
-  }, [db, callId, user, callStartTime]);
+  }, [db, callId, user]);
 
   useEffect(() => {
     if (callData && !setupStarted.current) {
@@ -1126,6 +1134,7 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
       stream.getTracks().forEach((track) => peerConnection.addTrack(track, stream));
 
       peerConnection.ontrack = (event) => {
+        console.log("Remote track received");
         if (event.streams && event.streams[0]) {
           setRemoteStream(event.streams[0]);
           setIsConnecting(false);
@@ -1139,13 +1148,24 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
         }
       };
 
+      peerConnection.oniceconnectionstatechange = () => {
+        console.log("ICE Connection State:", peerConnection.iceConnectionState);
+        if (peerConnection.iceConnectionState === 'connected') {
+          setIsConnecting(false);
+        }
+      };
+
       const candidatesPath = callData.callerId === user?.uid ? "calleeCandidates" : "callerCandidates";
       const unsubCandidates = onSnapshot(collection(db, "calls", callId, candidatesPath), (snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
           if (change.type === 'added' && pc.current && pc.current.signalingState !== 'closed') {
             const candidate = change.doc.data() as RTCIceCandidateInit;
             if (pc.current?.remoteDescription) {
-              try { await pc.current.addIceCandidate(new RTCIceCandidate(candidate)); } catch (e) {}
+              try { 
+                await pc.current.addIceCandidate(new RTCIceCandidate(candidate)); 
+              } catch (e) {
+                console.warn("Error adding ICE candidate", e);
+              }
             } else {
               iceBuffer.current.push(candidate);
             }
@@ -1157,31 +1177,51 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
       if (callData.callerId === user?.uid) {
         const offer = await peerConnection.createOffer();
         await peerConnection.setLocalDescription(offer);
-        updateDoc(doc(db, "calls", callId), { offer: { sdp: offer.sdp, type: offer.type } });
+        await updateDoc(doc(db, "calls", callId), { offer: { sdp: offer.sdp, type: offer.type } });
       }
     } catch (e: any) {
+      console.error("Hardware Error:", e);
       setPermissionError(true);
-      toast({ variant: "destructive", title: "Hardware Restricted", description: "Terminal access denied." });
+      toast({ variant: "destructive", title: "Hardware Restricted", description: "Camera/Mic access denied." });
     }
   };
 
   useEffect(() => {
     if (!pc.current || !callData || !user) return;
+    
     const processSignaling = async () => {
-      if (pc.current && pc.current.signalingState !== 'closed') {
-        if (callData.offer && user.uid === callData.calleeId && pc.current.signalingState === 'stable') {
-          await pc.current.setRemoteDescription(new RTCSessionDescription(callData.offer));
+      const peerConnection = pc.current;
+      if (!peerConnection || peerConnection.signalingState === 'closed') return;
+
+      // CALLEE PROCESSES OFFER
+      if (callData.offer && user.uid === callData.calleeId && peerConnection.signalingState === 'stable') {
+        console.log("Processing offer as callee");
+        try {
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(callData.offer));
           await drainIceBuffer();
-          const answer = await pc.current.createAnswer();
-          await pc.current.setLocalDescription(answer);
-          updateDoc(doc(db, "calls", callId), { answer: { type: answer.type, sdp: answer.sdp }, status: "active" });
+          const answer = await peerConnection.createAnswer();
+          await peerConnection.setLocalDescription(answer);
+          await updateDoc(doc(db, "calls", callId), { 
+            answer: { type: answer.type, sdp: answer.sdp },
+            status: "active" 
+          });
+        } catch (e) {
+          console.error("Error during callee handshake", e);
         }
-        if (callData.answer && user.uid === callData.callerId && pc.current.signalingState === 'have-local-offer') {
-          await pc.current.setRemoteDescription(new RTCSessionDescription(callData.answer));
+      }
+
+      // CALLER PROCESSES ANSWER
+      if (callData.answer && user.uid === callData.callerId && peerConnection.signalingState === 'have-local-offer') {
+        console.log("Processing answer as caller");
+        try {
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(callData.answer));
           await drainIceBuffer();
+        } catch (e) {
+          console.error("Error during caller handshake", e);
         }
       }
     };
+    
     processSignaling();
   }, [callData, user]);
 
@@ -1208,12 +1248,19 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
     if (!db || !callData) return;
     const status = callStartTime ? "ended" : "missed";
     const finalDuration = duration;
+    
     try {
       await updateDoc(doc(db, "calls", callId), { status });
       const chatId = [callData.callerId, callData.calleeId].sort().join("_");
       const logText = status === "missed" ? `Missed ${callData.type} call` : `${callData.type.toUpperCase()} call ended • ${finalDuration}`;
-      addDoc(collection(db, "chats", chatId, "messages"), { senderId: callData.callerId, text: logText, timestamp: Date.now(), status: "sent" });
+      addDoc(collection(db, "chats", chatId, "messages"), { 
+        senderId: user?.uid, 
+        text: logText, 
+        timestamp: Date.now(), 
+        status: "sent" 
+      });
     } catch (e) {}
+    
     cleanup();
     onEnd();
   };
@@ -1283,7 +1330,7 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
       </div>
       <div className="absolute top-8 left-1/2 -translate-x-1/2 bg-slate-900/80 backdrop-blur-md px-4 py-1.5 rounded-full border border-slate-800/50 flex items-center gap-2">
         <Clock className="h-3 w-3 text-slate-400" />
-        <span className="text-[8px] font-black text-slate-300 uppercase tracking-widest leading-none">{callStartTime ? `Talk Time: ${duration}` : "Establishing Link"}</span>
+        <span className="text-[8px] font-black text-slate-300 uppercase tracking-widest leading-none">{callStartTime ? `Talk Time: ${duration}` : "Handshake Pending"}</span>
       </div>
     </div>
   );
