@@ -988,7 +988,8 @@ const servers = {
         'stun:stun1.l.google.com:19302', 
         'stun:stun2.l.google.com:19302',
         'stun:stun3.l.google.com:19302',
-        'stun:stun4.l.google.com:19302'
+        'stun:stun4.l.google.com:19302',
+        'stun:stun.l.google.com:19302',
       ],
     },
   ],
@@ -1024,7 +1025,6 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
   const unsubscribes = useRef<(() => void)[]>([]);
   const hasLoggedResult = useRef(false);
   const setupAttempted = useRef(false);
-  const signalingStarted = useRef(false);
   
   const iceBuffer = useRef<RTCIceCandidateInit[]>([]);
 
@@ -1084,6 +1084,21 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
     return `${minutes}:${seconds.toString().padStart(2, '0')}`;
   };
 
+  // Helper to drain ICE buffer once remote description is set
+  const drainIceBuffer = async () => {
+    if (!pc.current || !pc.current.remoteDescription) return;
+    while (iceBuffer.current.length > 0) {
+      const candidate = iceBuffer.current.shift();
+      if (candidate) {
+        try {
+          await pc.current.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (e) {
+          console.warn("Failed to add buffered ICE candidate", e);
+        }
+      }
+    }
+  };
+
   useEffect(() => {
     if (localVideoRef.current && localStream) localVideoRef.current.srcObject = localStream;
   }, [localStream]);
@@ -1095,13 +1110,12 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
     }
   }, [remoteStream]);
 
-  // Main Call Monitoring Effect
   useEffect(() => {
     if (!db || !callId) return;
 
     const unsubscribe = onSnapshot(
       doc(db, "calls", callId), 
-      (snapshot) => {
+      async (snapshot) => {
         const data = snapshot.data();
         if (!data) return;
         setCallData(data);
@@ -1129,14 +1143,33 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
           }, 1000);
         }
 
-        // Handshake: Callee reacts to offer
-        if (!signalingStarted.current && data.offer && data.calleeId === user?.uid && pc.current) {
-          handleIncomingOffer(data.offer);
-        }
+        // Signaling logic
+        if (pc.current) {
+          // CALLEE receives offer
+          if (data.offer && data.calleeId === user?.uid && pc.current.signalingState === 'stable') {
+            try {
+              await pc.current.setRemoteDescription(new RTCSessionDescription(data.offer));
+              await drainIceBuffer();
+              const answer = await pc.current.createAnswer();
+              await pc.current.setLocalDescription(answer);
+              await updateDoc(doc(db, "calls", callId), { 
+                answer: { type: answer.type, sdp: answer.sdp },
+                status: "active"
+              });
+            } catch (e) {
+              console.error("Callee signaling error:", e);
+            }
+          }
 
-        // Handshake: Caller reacts to answer
-        if (!signalingStarted.current && data.answer && data.callerId === user?.uid && pc.current && pc.current.signalingState === 'have-local-offer') {
-          handleIncomingAnswer(data.answer);
+          // CALLER receives answer
+          if (data.answer && data.callerId === user?.uid && pc.current.signalingState === 'have-local-offer') {
+            try {
+              await pc.current.setRemoteDescription(new RTCSessionDescription(data.answer));
+              await drainIceBuffer();
+            } catch (e) {
+              console.error("Caller signaling error:", e);
+            }
+          }
         }
 
         if (data.status === "ended" || data.status === "missed") {
@@ -1152,9 +1185,8 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
 
     unsubscribes.current.push(unsubscribe);
     return () => cleanup();
-  }, [db, callId, user]);
+  }, [db, callId, user, callStartTime]);
 
-  // Setup Peer Connection & Local Media
   useEffect(() => {
     if (callData && !setupAttempted.current) {
       setupAttempted.current = true;
@@ -1166,13 +1198,17 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
     if (pc.current || !callData) return;
 
     try {
+      // Use more flexible constraints for mobile hardware compatibility
       const stream = await navigator.mediaDevices.getUserMedia({
         video: callData.type === "video" ? {
           facingMode: "user",
-          width: { ideal: 640 }, // Lowering for better mobile compatibility
-          height: { ideal: 480 }
+          width: { ideal: 480 },
+          height: { ideal: 640 }
         } : false,
-        audio: true
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true
+        }
       });
       
       setLocalStream(stream);
@@ -1199,14 +1235,16 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
 
       setIsConnecting(false);
 
-      // Setup Listeners for Candidates
+      // Listen for remote ICE candidates
       const candidatesPath = callData.callerId === user?.uid ? "calleeCandidates" : "callerCandidates";
       const unsubCandidates = onSnapshot(collection(db, "calls", callId, candidatesPath), (snapshot) => {
-        snapshot.docChanges().forEach((change) => {
+        snapshot.docChanges().forEach(async (change) => {
           if (change.type === 'added' && pc.current && pc.current.signalingState !== 'closed') {
             const candidate = change.doc.data() as RTCIceCandidateInit;
             if (pc.current?.remoteDescription) {
-              pc.current.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
+              try {
+                await pc.current.addIceCandidate(new RTCIceCandidate(candidate));
+              } catch (e) {}
             } else {
               iceBuffer.current.push(candidate);
             }
@@ -1215,54 +1253,17 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
       });
       unsubscribes.current.push(unsubCandidates);
 
-      // If I am the caller, start the offer process
-      if (callData.callerId === user?.uid) {
-        const offerDescription = await peerConnection.createOffer();
-        await peerConnection.setLocalDescription(offerDescription);
+      // Initial Offer Creation (Caller Only)
+      if (callData.callerId === user?.uid && peerConnection.signalingState === 'stable') {
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
         await updateDoc(doc(db, "calls", callId), { 
-          offer: { sdp: offerDescription.sdp, type: offerDescription.type } 
+          offer: { sdp: offer.sdp, type: offer.type } 
         });
-      } else if (callData.offer) {
-        // If I am the callee and offer already exists
-        handleIncomingOffer(callData.offer);
       }
     } catch (e: any) {
       setPermissionError(true);
       toast({ variant: "destructive", title: "Hardware Restricted", description: "Terminal access denied." });
-    }
-  };
-
-  const handleIncomingOffer = async (offer: any) => {
-    if (!pc.current || signalingStarted.current) return;
-    signalingStarted.current = true;
-    try {
-      await pc.current.setRemoteDescription(new RTCSessionDescription(offer));
-      while (iceBuffer.current.length > 0) {
-        const candidate = iceBuffer.current.shift();
-        if (candidate) await pc.current.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
-      }
-      const answerDescription = await pc.current.createAnswer();
-      await pc.current.setLocalDescription(answerDescription);
-      await updateDoc(doc(db, "calls", callId), { 
-        answer: { type: answerDescription.type, sdp: answerDescription.sdp },
-        status: "active" 
-      });
-    } catch (e) {
-      console.error("Failed to handle incoming offer", e);
-    }
-  };
-
-  const handleIncomingAnswer = async (answer: any) => {
-    if (!pc.current || pc.current.signalingState !== 'have-local-offer') return;
-    signalingStarted.current = true;
-    try {
-      await pc.current.setRemoteDescription(new RTCSessionDescription(answer));
-      while (iceBuffer.current.length > 0) {
-        const candidate = iceBuffer.current.shift();
-        if (candidate) await pc.current.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
-      }
-    } catch (e) {
-      console.error("Failed to handle incoming answer", e);
     }
   };
 
@@ -1306,9 +1307,13 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
 
   if (!callData) return null;
 
+  const otherPersonName = callData.callerId === user?.uid ? callData.calleeName : callData.callerName;
+  const otherPersonPhoto = callData.callerId === user?.uid ? callData.calleePhoto : callData.callerPhoto;
+
   return (
     <div className="fixed inset-0 z-[10000] bg-slate-950 flex flex-col items-center justify-center animate-in fade-in duration-500">
       <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
+      
       <div className="absolute inset-0 w-full h-full overflow-hidden flex items-center justify-center">
         <video 
           ref={remoteVideoRef} 
@@ -1319,14 +1324,14 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
         {(callData.type !== "video" || !remoteStream) && (
           <div className="flex flex-col items-center gap-6">
             <Avatar className="h-32 w-32 border-4 border-slate-800 shadow-2xl">
-              <AvatarImage src={callData.callerId === user?.uid ? callData.calleePhoto : callData.callerPhoto} />
+              <AvatarImage src={otherPersonPhoto} />
               <AvatarFallback className="bg-slate-900 text-white text-4xl font-black">
-                {(callData.callerId === user?.uid ? callData.calleeName : callData.callerName)?.charAt(0)}
+                {otherPersonName?.charAt(0)}
               </AvatarFallback>
             </Avatar>
             <div className="text-center space-y-2">
               <h2 className="text-2xl font-black text-white uppercase tracking-widest">
-                {callData.callerId === user?.uid && isConnecting ? "Connecting..." : (callData.callerId === user?.uid ? callData.calleeName : callData.callerName)}
+                {isConnecting ? "Connecting..." : otherPersonName}
               </h2>
               <div className="flex items-center justify-center gap-2">
                 <div className={`h-1.5 w-1.5 rounded-full ${callStartTime ? 'bg-green-500 animate-pulse' : 'bg-yellow-500 animate-bounce'}`} />
