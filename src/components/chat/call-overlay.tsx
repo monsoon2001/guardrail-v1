@@ -946,6 +946,7 @@
 
 
 
+
 "use client";
 
 import { useState, useEffect, useRef } from "react";
@@ -970,15 +971,10 @@ import {
   Volume2
 } from "lucide-react";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
-import { useToast } from "@/hooks/use-toast";
-import { errorEmitter } from "@/firebase/error-emitter";
-import { FirestorePermissionError } from "@/firebase/errors";
 
 const servers = {
   iceServers: [
-    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
-    { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
-    { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+    { urls: ['stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
   ],
   iceCandidatePoolSize: 10,
 };
@@ -986,7 +982,6 @@ const servers = {
 export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => void }) {
   const { user } = useAuth();
   const db = useFirestore();
-  const { toast } = useToast();
   
   const [callData, setCallData] = useState<any>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
@@ -1004,37 +999,21 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
   const remoteAudioRef = useRef<HTMLAudioElement>(null);
   
   const pc = useRef<RTCPeerConnection | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const iceBuffer = useRef<RTCIceCandidateInit[]>([]);
   const isInitialized = useRef(false);
-  const hasAppliedOffer = useRef(false);
 
   const cleanup = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => {
-        track.enabled = false;
-        track.stop();
-      });
-    }
-    streamRef.current = null;
-
     if (pc.current) {
-      pc.current.ontrack = null;
-      pc.current.onicecandidate = null;
-      if (pc.current.signalingState !== 'closed') {
-        pc.current.close();
-      }
+      pc.current.close();
       pc.current = null;
     }
-
+    if (localStream) {
+      localStream.getTracks().forEach(track => track.stop());
+    }
     setLocalStream(null);
     setRemoteStream(null);
-    isInitialized.current = false;
-    hasAppliedOffer.current = false;
-    iceBuffer.current = [];
   };
 
-  // Monitor call status for global termination
+  // 1. Monitor Call Document State
   useEffect(() => {
     if (!db || !callId) return;
 
@@ -1056,21 +1035,18 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
     return () => unsub();
   }, [db, callId, onEnd, callStartTime]);
 
-  // Peer Connection & Handshake Logic
+  // 2. Initialize WebRTC
   useEffect(() => {
     if (!db || !user || !callData || isInitialized.current) return;
+    isInitialized.current = true;
 
     const init = async () => {
-      isInitialized.current = true;
       try {
-        const constraints = {
-          video: callData.type === "video" ? { facingMode: "user" } : false,
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: callData.type === "video",
           audio: true
-        };
-        
-        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        });
         setLocalStream(stream);
-        streamRef.current = stream;
 
         const peerConnection = new RTCPeerConnection(servers);
         pc.current = peerConnection;
@@ -1085,30 +1061,50 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
         };
 
         peerConnection.onicecandidate = (event) => {
-          if (event.candidate && pc.current && pc.current.signalingState !== 'closed') {
+          if (event.candidate) {
             const path = user.uid === callData.callerId ? "callerCandidates" : "calleeCandidates";
             addDoc(collection(db, "calls", callId, path), event.candidate.toJSON());
           }
         };
 
-        // Caller: Create and send Offer
-        if (user.uid === callData.callerId && !callData.offer) {
+        // Handshake Logic
+        if (user.uid === callData.callerId) {
+          // Caller creates offer
           const offer = await peerConnection.createOffer();
           await peerConnection.setLocalDescription(offer);
           await updateDoc(doc(db, "calls", callId), { offer: { sdp: offer.sdp, type: offer.type } });
+          
+          // Listen for Answer
+          onSnapshot(doc(db, "calls", callId), async (snap) => {
+            const data = snap.data();
+            if (data?.answer && peerConnection.signalingState === "have-local-offer") {
+              await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+            }
+          });
+        } else {
+          // Callee waits for offer
+          onSnapshot(doc(db, "calls", callId), async (snap) => {
+            const data = snap.data();
+            if (data?.offer && peerConnection.signalingState === "stable") {
+              await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+              const answer = await peerConnection.createAnswer();
+              await peerConnection.setLocalDescription(answer);
+              await updateDoc(doc(db, "calls", callId), { 
+                answer: { sdp: answer.sdp, type: answer.type },
+                status: "active"
+              });
+            }
+          });
         }
 
-        // Listen for candidates
+        // Listen for remote ICE candidates
         const remotePath = user.uid === callData.callerId ? "calleeCandidates" : "callerCandidates";
         onSnapshot(collection(db, "calls", callId, remotePath), (snap) => {
           snap.docChanges().forEach(async (change) => {
-            if (change.type === 'added') {
-              const cand = change.doc.data() as RTCIceCandidateInit;
-              if (pc.current?.remoteDescription) {
-                try { await pc.current.addIceCandidate(new RTCIceCandidate(cand)); } catch (e) {}
-              } else {
-                iceBuffer.current.push(cand);
-              }
+            if (change.type === 'added' && pc.current) {
+              try {
+                await pc.current.addIceCandidate(new RTCIceCandidate(change.doc.data()));
+              } catch (e) {}
             }
           });
         });
@@ -1120,41 +1116,6 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
 
     init();
   }, [db, user, callData, callId]);
-
-  // Reactive Handshake Processing
-  useEffect(() => {
-    const processHandshake = async () => {
-      const p = pc.current;
-      if (!p || !callData || !user) return;
-
-      // Callee: Process Offer and Send Answer
-      if (user.uid === callData.calleeId && callData.offer && !hasAppliedOffer.current) {
-        hasAppliedOffer.current = true;
-        await p.setRemoteDescription(new RTCSessionDescription(callData.offer));
-        while (iceBuffer.current.length) {
-          const cand = iceBuffer.current.shift();
-          if (cand) await p.addIceCandidate(new RTCIceCandidate(cand));
-        }
-        const answer = await p.createAnswer();
-        await p.setLocalDescription(answer);
-        await updateDoc(doc(db, "calls", callId), { 
-          answer: { sdp: answer.sdp, type: answer.type },
-          status: "active" 
-        });
-      }
-
-      // Caller: Process Answer
-      if (user.uid === callData.callerId && callData.answer && p.signalingState === 'have-local-offer') {
-        await p.setRemoteDescription(new RTCSessionDescription(callData.answer));
-        while (iceBuffer.current.length) {
-          const cand = iceBuffer.current.shift();
-          if (cand) await p.addIceCandidate(new RTCIceCandidate(cand));
-        }
-      }
-    };
-
-    processHandshake();
-  }, [callData, user, callId, db]);
 
   // Media Attachment
   useEffect(() => {
@@ -1191,8 +1152,6 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
   const endCall = async () => {
     if (!db || !callId) return;
     await updateDoc(doc(db, "calls", callId), { status: "ended" });
-    cleanup();
-    onEnd();
   };
 
   const otherName = user?.uid === callData?.callerId ? callData?.calleeName : callData?.callerName;
@@ -1240,14 +1199,14 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
       )}
 
       <div className="absolute bottom-12 flex items-center gap-6 z-[100]">
-        <button onClick={() => { if(streamRef.current) { streamRef.current.getAudioTracks().forEach(t => t.enabled = !t.enabled); setIsMuted(!isMuted); }}} className={`h-14 w-14 rounded-2xl flex items-center justify-center transition-all ${isMuted ? 'bg-red-500' : 'bg-slate-900/50 hover:bg-slate-800'}`}>
+        <button onClick={() => { if(localStream) { localStream.getAudioTracks().forEach(t => t.enabled = !t.enabled); setIsMuted(!isMuted); }}} className={`h-14 w-14 rounded-2xl flex items-center justify-center transition-all ${isMuted ? 'bg-red-500' : 'bg-slate-900/50 hover:bg-slate-800'}`}>
           {isMuted ? <MicOff className="h-6 w-6 text-white" /> : <Mic className="h-6 w-6 text-white" />}
         </button>
         <button onClick={endCall} className="h-18 w-18 rounded-3xl bg-red-600 hover:bg-red-700 text-white shadow-2xl active:scale-90 transition-all flex items-center justify-center">
           <PhoneOff className="h-8 w-8" />
         </button>
         {callData?.type === "video" && (
-          <button onClick={() => { if(streamRef.current) { streamRef.current.getVideoTracks().forEach(t => t.enabled = !t.enabled); setIsVideoOff(!isVideoOff); }}} className={`h-14 w-14 rounded-2xl flex items-center justify-center transition-all ${isVideoOff ? 'bg-red-500' : 'bg-slate-900/50 hover:bg-slate-800'}`}>
+          <button onClick={() => { if(localStream) { localStream.getVideoTracks().forEach(t => t.enabled = !t.enabled); setIsVideoOff(!isVideoOff); }}} className={`h-14 w-14 rounded-2xl flex items-center justify-center transition-all ${isVideoOff ? 'bg-red-500' : 'bg-slate-900/50 hover:bg-slate-800'}`}>
             {isVideoOff ? <VideoOff className="h-6 w-6 text-white" /> : <Video className="h-6 w-6 text-white" />}
           </button>
         )}
