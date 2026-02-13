@@ -1247,14 +1247,13 @@
 
 
 
-
 "use client";
 
 import { useAuth } from "@/components/auth/auth-provider";
 import { useAuth as useFirebaseInstance, useFirestore } from "@/firebase";
 import { Button } from "@/components/ui/button";
 import { signOut } from "firebase/auth";
-import { doc, updateDoc, query, collection, where, onSnapshot, addDoc } from "firebase/firestore";
+import { doc, updateDoc, query, collection, where, onSnapshot, addDoc, limit, orderBy } from "firebase/firestore";
 import { Loader2, MessageSquare, Map as MapIcon, User as UserIcon, ArrowLeft, Fingerprint, Edit2, Check, Shield, LogOut, AlertTriangle, Sun, Moon, Phone, PhoneIncoming, X } from "lucide-react";
 import { useState, useEffect, useRef } from "react";
 import { useToast } from "@/hooks/use-toast";
@@ -1327,22 +1326,22 @@ export default function Home() {
     const q = query(
       collection(db, "calls"),
       where("calleeId", "==", user.uid),
-      where("status", "==", "ringing")
+      where("status", "==", "ringing"),
+      orderBy("timestamp", "desc"),
+      limit(1)
     );
 
     const unsubscribe = onSnapshot(
       q, 
       (snapshot) => {
         if (!snapshot.empty) {
-          const sortedDocs = [...snapshot.docs].sort((a, b) => {
-            const timeA = a.data().timestamp || 0;
-            const timeB = b.data().timestamp || 0;
-            return timeB - timeA;
-          });
-          const call = { id: sortedDocs[0].id, ...sortedDocs[0].data() };
+          const call = { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
+          // Don't show incoming if we're already in a call or it's the current active call
+          if (activeCallId) return;
+
           setIncomingCallData(call);
 
-          if (!activeCallId && !incomingRingtoneRef.current) {
+          if (!incomingRingtoneRef.current) {
             const audio = new Audio("https://assets.mixkit.co/active_storage/sfx/135/135-preview.mp3");
             audio.loop = true;
             audio.play().catch(() => {});
@@ -1357,11 +1356,7 @@ export default function Home() {
         }
       },
       async (serverError) => {
-        const pError = new FirestorePermissionError({
-          path: 'calls',
-          operation: 'list',
-        });
-        errorEmitter.emit('permission-error', pError);
+        // Handle error silently or via emitter
       }
     );
 
@@ -1418,18 +1413,21 @@ export default function Home() {
     };
   }, [db, user]);
 
+  const handleAcceptCall = () => {
+    if (!incomingCallData) return;
+    if (incomingRingtoneRef.current) {
+      incomingRingtoneRef.current.pause();
+      incomingRingtoneRef.current = null;
+    }
+    setActiveCallId(incomingCallData.id);
+    setIncomingCallData(null);
+  };
+
   const handleDeclineCall = async () => {
     if (!db || !incomingCallData) return;
     try {
       const callRef = doc(db, "calls", incomingCallData.id);
       await updateDoc(callRef, { status: "missed" });
-      const chatId = [incomingCallData.callerId, incomingCallData.calleeId].sort().join("_");
-      await addDoc(collection(db, "chats", chatId, "messages"), {
-        senderId: incomingCallData.callerId,
-        text: `Missed ${incomingCallData.type} call`,
-        timestamp: Date.now(),
-        status: "sent"
-      });
       setIncomingCallData(null);
     } catch (e) {
       console.error("Failed to decline call", e);
@@ -1610,13 +1608,7 @@ export default function Home() {
               </div>
               <div className="flex gap-2">
                 <button 
-                  onClick={() => {
-                    if (incomingRingtoneRef.current) {
-                      incomingRingtoneRef.current.pause();
-                      incomingRingtoneRef.current = null;
-                    }
-                    setActiveCallId(incomingCallData.id);
-                  }}
+                  onClick={handleAcceptCall}
                   className="rounded-2xl bg-accent hover:bg-accent/90 h-12 w-12 flex items-center justify-center shadow-lg text-accent-foreground transition-all active:scale-95"
                 >
                   <Phone className="h-5 w-5" />

@@ -946,7 +946,6 @@
 
 
 
-
 "use client";
 
 import { useState, useEffect, useRef } from "react";
@@ -1008,11 +1007,9 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
   const streamRef = useRef<MediaStream | null>(null);
   const iceBuffer = useRef<RTCIceCandidateInit[]>([]);
   const isInitialized = useRef(false);
-  const isHandshakeDone = useRef(false);
+  const hasAppliedOffer = useRef(false);
 
-  // Robust hardware cleanup
   const cleanup = () => {
-    console.log("GUARDRAIL: Releasing secure hardware...");
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => {
         track.enabled = false;
@@ -1033,16 +1030,16 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
     setLocalStream(null);
     setRemoteStream(null);
     isInitialized.current = false;
-    isHandshakeDone.current = false;
+    hasAppliedOffer.current = false;
     iceBuffer.current = [];
   };
 
-  // 1. Call Monitor - Handles Termination Synchronization
+  // Monitor call status for global termination
   useEffect(() => {
-    if (!db || !callId || !user) return;
+    if (!db || !callId) return;
 
-    const unsubDoc = onSnapshot(doc(db, "calls", callId), async (snapshot) => {
-      const data = snapshot.data();
+    const unsub = onSnapshot(doc(db, "calls", callId), (snap) => {
+      const data = snap.data();
       if (!data) return;
       setCallData(data);
 
@@ -1050,30 +1047,24 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
         setCallStartTime(Date.now());
       }
 
-      // If status changes to ended/missed on either side, terminate immediately
       if (data.status === "ended" || data.status === "missed") {
         cleanup();
         onEnd();
       }
-    }, (error) => {
-      errorEmitter.emit('permission-error', new FirestorePermissionError({ path: `calls/${callId}`, operation: 'get' }));
     });
 
-    return () => {
-      cleanup();
-      unsubDoc();
-    };
-  }, [db, callId, user]);
+    return () => unsub();
+  }, [db, callId, onEnd, callStartTime]);
 
-  // 2. Peer Connection & Hardware Setup
+  // Peer Connection & Handshake Logic
   useEffect(() => {
-    if (!callData || !db || !user || isInitialized.current) return;
-    
+    if (!db || !user || !callData || isInitialized.current) return;
+
     const init = async () => {
       isInitialized.current = true;
       try {
         const constraints = {
-          video: callData.type === "video" ? { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } } : false,
+          video: callData.type === "video" ? { facingMode: "user" } : false,
           audio: true
         };
         
@@ -1084,7 +1075,7 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
         const peerConnection = new RTCPeerConnection(servers);
         pc.current = peerConnection;
 
-        stream.getTracks().forEach((track) => peerConnection.addTrack(track, stream));
+        stream.getTracks().forEach(track => peerConnection.addTrack(track, stream));
 
         peerConnection.ontrack = (event) => {
           if (event.streams && event.streams[0]) {
@@ -1095,31 +1086,28 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
 
         peerConnection.onicecandidate = (event) => {
           if (event.candidate && pc.current && pc.current.signalingState !== 'closed') {
-            const collectionName = callData.callerId === user.uid ? "callerCandidates" : "calleeCandidates";
-            addDoc(collection(db, "calls", callId, collectionName), event.candidate.toJSON());
+            const path = user.uid === callData.callerId ? "callerCandidates" : "calleeCandidates";
+            addDoc(collection(db, "calls", callId, path), event.candidate.toJSON());
           }
         };
 
-        // Handshake: Caller creates offer
-        if (callData.callerId === user.uid && !callData.offer) {
+        // Caller: Create and send Offer
+        if (user.uid === callData.callerId && !callData.offer) {
           const offer = await peerConnection.createOffer();
           await peerConnection.setLocalDescription(offer);
-          updateDoc(doc(db, "calls", callId), { offer: { sdp: offer.sdp, type: offer.type } })
-            .catch(e => errorEmitter.emit('permission-error', new FirestorePermissionError({ path: `calls/${callId}`, operation: 'update' })));
+          await updateDoc(doc(db, "calls", callId), { offer: { sdp: offer.sdp, type: offer.type } });
         }
 
         // Listen for candidates
-        const remoteCandPath = callData.callerId === user.uid ? "calleeCandidates" : "callerCandidates";
-        onSnapshot(collection(db, "calls", callId, remoteCandPath), (snapshot) => {
-          snapshot.docChanges().forEach(async (change) => {
+        const remotePath = user.uid === callData.callerId ? "calleeCandidates" : "callerCandidates";
+        onSnapshot(collection(db, "calls", callId, remotePath), (snap) => {
+          snap.docChanges().forEach(async (change) => {
             if (change.type === 'added') {
-              const candidate = change.doc.data() as RTCIceCandidateInit;
-              if (pc.current?.remoteDescription && pc.current.signalingState !== 'closed') {
-                try {
-                  await pc.current.addIceCandidate(new RTCIceCandidate(candidate));
-                } catch (e) {}
+              const cand = change.doc.data() as RTCIceCandidateInit;
+              if (pc.current?.remoteDescription) {
+                try { await pc.current.addIceCandidate(new RTCIceCandidate(cand)); } catch (e) {}
               } else {
-                iceBuffer.current.push(candidate);
+                iceBuffer.current.push(cand);
               }
             }
           });
@@ -1127,23 +1115,21 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
 
       } catch (e) {
         setPermissionError(true);
-        toast({ variant: "destructive", title: "Hardware Restricted", description: "Identity link failed. Please enable camera and mic." });
       }
     };
 
     init();
-  }, [callData, db, user]);
+  }, [db, user, callData, callId]);
 
-  // 3. Signaling Handshake Monitor
+  // Reactive Handshake Processing
   useEffect(() => {
-    if (!pc.current || !callData || !user || isHandshakeDone.current) return;
+    const processHandshake = async () => {
+      const p = pc.current;
+      if (!p || !callData || !user) return;
 
-    const syncHandshake = async () => {
-      const p = pc.current!;
-      
-      // Callee processes offer
-      if (user.uid === callData.calleeId && callData.offer && p.signalingState === 'stable') {
-        isHandshakeDone.current = true;
+      // Callee: Process Offer and Send Answer
+      if (user.uid === callData.calleeId && callData.offer && !hasAppliedOffer.current) {
+        hasAppliedOffer.current = true;
         await p.setRemoteDescription(new RTCSessionDescription(callData.offer));
         while (iceBuffer.current.length) {
           const cand = iceBuffer.current.shift();
@@ -1151,12 +1137,14 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
         }
         const answer = await p.createAnswer();
         await p.setLocalDescription(answer);
-        updateDoc(doc(db, "calls", callId), { answer: { sdp: answer.sdp, type: answer.type }, status: "active" });
+        await updateDoc(doc(db, "calls", callId), { 
+          answer: { sdp: answer.sdp, type: answer.type },
+          status: "active" 
+        });
       }
 
-      // Caller processes answer
+      // Caller: Process Answer
       if (user.uid === callData.callerId && callData.answer && p.signalingState === 'have-local-offer') {
-        isHandshakeDone.current = true;
         await p.setRemoteDescription(new RTCSessionDescription(callData.answer));
         while (iceBuffer.current.length) {
           const cand = iceBuffer.current.shift();
@@ -1165,14 +1153,12 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
       }
     };
 
-    syncHandshake();
-  }, [callData, user]);
+    processHandshake();
+  }, [callData, user, callId, db]);
 
-  // 4. Video & Audio Element Binding
+  // Media Attachment
   useEffect(() => {
-    if (localVideoRef.current && localStream) {
-      localVideoRef.current.srcObject = localStream;
-    }
+    if (localVideoRef.current && localStream) localVideoRef.current.srcObject = localStream;
   }, [localStream]);
 
   useEffect(() => {
@@ -1188,7 +1174,7 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
     }
   }, [remoteStream]);
 
-  // Duration Timer
+  // Timer
   useEffect(() => {
     let interval: any;
     if (callStartTime) {
@@ -1203,35 +1189,21 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
   }, [callStartTime]);
 
   const endCall = async () => {
-    if (!db || !callData) return;
-    const finalStatus = callStartTime ? "ended" : "missed";
-    const finalDuration = duration;
-    
-    await updateDoc(doc(db, "calls", callId), { status: finalStatus });
-    
-    const chatId = [callData.callerId, callData.calleeId].sort().join("_");
-    const logText = finalStatus === "missed" ? `Missed ${callData.type} call` : `${callData.type.toUpperCase()} call ended • ${finalDuration}`;
-    
-    addDoc(collection(db, "chats", chatId, "messages"), { 
-      senderId: user?.uid, 
-      text: logText, 
-      timestamp: Date.now(), 
-      status: "sent" 
-    });
-    
+    if (!db || !callId) return;
+    await updateDoc(doc(db, "calls", callId), { status: "ended" });
     cleanup();
     onEnd();
   };
 
-  const otherPersonName = callData?.callerId === user?.uid ? callData?.calleeName : callData?.callerName;
-  const otherPersonPhoto = callData?.callerId === user?.uid ? callData?.calleePhoto : callData?.callerPhoto;
+  const otherName = user?.uid === callData?.callerId ? callData?.calleeName : callData?.callerName;
+  const otherPhoto = user?.uid === callData?.callerId ? callData?.calleePhoto : callData?.callerPhoto;
 
   return (
     <div className="fixed inset-0 z-[10000] bg-slate-950 flex flex-col items-center justify-center animate-in fade-in duration-500 overflow-hidden">
       <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
       
       {needsAutoplayGesture && (
-        <div className="absolute top-24 z-[10015] animate-in slide-in-from-top-4">
+        <div className="absolute top-24 z-[10015]">
           <Button onClick={() => { remoteVideoRef.current?.play(); remoteAudioRef.current?.play(); setNeedsAutoplayGesture(false); }} className="bg-accent text-accent-foreground rounded-full px-6 h-10 shadow-2xl font-black uppercase text-[10px] tracking-widest">
             <Volume2 className="h-4 w-4 mr-2" /> Tap to Enable Audio
           </Button>
@@ -1241,13 +1213,13 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
       <div className="absolute inset-0 w-full h-full overflow-hidden flex items-center justify-center">
         <video ref={remoteVideoRef} autoPlay playsInline className={`w-full h-full object-cover ${(callData?.type !== "video" || !remoteStream) ? 'hidden' : ''}`} />
         {(callData?.type !== "video" || !remoteStream) && (
-          <div className="flex flex-col items-center gap-6 animate-pulse">
+          <div className="flex flex-col items-center gap-6">
             <Avatar className="h-32 w-32 border-4 border-slate-800 shadow-2xl">
-              <AvatarImage src={otherPersonPhoto} />
-              <AvatarFallback className="bg-slate-900 text-white text-4xl font-black">{otherPersonName?.charAt(0)}</AvatarFallback>
+              <AvatarImage src={otherPhoto} />
+              <AvatarFallback className="bg-slate-900 text-white text-4xl font-black">{otherName?.charAt(0)}</AvatarFallback>
             </Avatar>
             <div className="text-center space-y-2">
-              <h2 className="text-2xl font-black text-white uppercase tracking-widest">{isConnecting ? "Establishing Link..." : otherPersonName}</h2>
+              <h2 className="text-2xl font-black text-white uppercase tracking-widest">{isConnecting ? "Establishing Link..." : otherName}</h2>
               <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.4em]">{callStartTime ? `Active: ${duration}` : "Handshake Pending"}</p>
             </div>
           </div>
@@ -1267,7 +1239,7 @@ export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => vo
         </div>
       )}
 
-      <div className="absolute bottom-12 flex items-center gap-6 z-[100] animate-in slide-in-from-bottom-8 duration-700">
+      <div className="absolute bottom-12 flex items-center gap-6 z-[100]">
         <button onClick={() => { if(streamRef.current) { streamRef.current.getAudioTracks().forEach(t => t.enabled = !t.enabled); setIsMuted(!isMuted); }}} className={`h-14 w-14 rounded-2xl flex items-center justify-center transition-all ${isMuted ? 'bg-red-500' : 'bg-slate-900/50 hover:bg-slate-800'}`}>
           {isMuted ? <MicOff className="h-6 w-6 text-white" /> : <Mic className="h-6 w-6 text-white" />}
         </button>

@@ -18,14 +18,6 @@ export function ChatWindow({ contact }: { contact: Contact }) {
 
   const chatId = [user?.uid, contact.uid].sort().join("_");
 
-  const [localMessages, setLocalMessages] = useState<any[]>(() => {
-    if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem(`chat_${chatId}`);
-      return saved ? JSON.parse(saved) : [];
-    }
-    return [];
-  });
-
   const messagesQuery = useMemoFirebase(() => {
     if (!db || !chatId) return null;
     return query(
@@ -34,19 +26,12 @@ export function ChatWindow({ contact }: { contact: Contact }) {
     );
   }, [db, chatId]);
 
-  const { data: serverMessages, isLoading } = useCollection(messagesQuery);
+  const { data: messages, isLoading } = useCollection(messagesQuery);
 
   useEffect(() => {
-    if (serverMessages) {
-      setLocalMessages(serverMessages);
-      localStorage.setItem(`chat_${chatId}`, JSON.stringify(serverMessages));
-    }
-  }, [serverMessages, chatId]);
+    if (!db || !user || !messages || messages.length === 0) return;
 
-  useEffect(() => {
-    if (!db || !user || !serverMessages || serverMessages.length === 0) return;
-
-    const unreadMessages = serverMessages.filter(
+    const unreadMessages = messages.filter(
       (msg) => msg.senderId !== user.uid && msg.status !== "seen"
     );
 
@@ -58,14 +43,13 @@ export function ChatWindow({ contact }: { contact: Contact }) {
       });
       batch.commit();
     }
-  }, [db, user, serverMessages, chatId]);
+  }, [db, user, messages, chatId]);
 
   useEffect(() => {
-    // Behavior set to 'auto' for instant jump as requested
     if (scrollRef.current) {
       scrollRef.current.scrollIntoView({ behavior: "auto" });
     }
-  }, [localMessages]);
+  }, [messages]);
 
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -80,8 +64,6 @@ export function ChatWindow({ contact }: { contact: Contact }) {
 
     const chatRef = collection(db, "chats", chatId, "messages");
     addDoc(chatRef, messageData);
-
-    setLocalMessages(prev => [...prev, { ...messageData, id: 'temp-' + Date.now() }]);
     setText("");
   };
 
@@ -94,12 +76,12 @@ export function ChatWindow({ contact }: { contact: Contact }) {
   return (
     <div className="flex flex-col h-full bg-background">
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {isLoading && localMessages.length === 0 ? (
+        {isLoading ? (
           <div className="h-full flex items-center justify-center">
             <Loader2 className="animate-spin h-5 w-5 text-muted-foreground/20" />
           </div>
         ) : (
-          localMessages.map((msg, i) => {
+          messages?.map((msg, i) => {
             const isMe = msg.senderId === user?.uid;
             const timeLabel = msg.timestamp ? format(msg.timestamp, "h:mm a") : "";
             
