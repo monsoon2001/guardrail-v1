@@ -974,13 +974,6 @@ import {
 } from "lucide-react";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { useToast } from "@/hooks/use-toast";
-import { errorEmitter } from "@/firebase/error-emitter";
-import { FirestorePermissionError } from "@/firebase/errors";
-
-interface CallOverlayProps {
-  callId: string;
-  onEnd: () => void;
-}
 
 const servers = {
   iceServers: [
@@ -988,8 +981,6 @@ const servers = {
       urls: [
         'stun:stun1.l.google.com:19302', 
         'stun:stun2.l.google.com:19302',
-        'stun:stun3.l.google.com:19302',
-        'stun:stun4.l.google.com:19302',
         'stun:stun.l.google.com:19302',
       ],
     },
@@ -997,7 +988,7 @@ const servers = {
   iceCandidatePoolSize: 10,
 };
 
-export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
+export function CallOverlay({ callId, onEnd }: { callId: string; onEnd: () => void }) {
   const { user } = useAuth();
   const db = useFirestore();
   const { toast } = useToast();
@@ -1023,7 +1014,6 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
   const setupStarted = useRef(false);
   const unsubscribes = useRef<(() => void)[]>([]);
 
-  // Cleanup helper
   const cleanup = () => {
     unsubscribes.current.forEach(unsub => unsub());
     unsubscribes.current = [];
@@ -1071,9 +1061,7 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
       if (candidate) {
         try {
           await pc.current.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (e) {
-          console.warn("Failed to add buffered ICE candidate", e);
-        }
+        } catch (e) {}
       }
     }
   };
@@ -1081,7 +1069,6 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
   useEffect(() => {
     if (!db || !callId || !user) return;
 
-    // Listen to call document for status and signaling
     const unsubDoc = onSnapshot(doc(db, "calls", callId), async (snapshot) => {
       const data = snapshot.data();
       if (!data) return;
@@ -1099,34 +1086,6 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
 
       if (data.status === "active" && !callStartTime) {
         setCallStartTime(Date.now());
-      }
-
-      // Signaling logic
-      if (pc.current && pc.current.signalingState !== 'closed') {
-        // Callee: process offer
-        if (data.offer && user.uid === data.calleeId && pc.current.signalingState === 'stable') {
-          try {
-            await pc.current.setRemoteDescription(new RTCSessionDescription(data.offer));
-            await drainIceBuffer();
-            const answer = await pc.current.createAnswer();
-            await pc.current.setLocalDescription(answer);
-            updateDoc(doc(db, "calls", callId), { 
-              answer: { type: answer.type, sdp: answer.sdp },
-              status: "active"
-            });
-          } catch (e) {
-            console.error("Callee error setting offer:", e);
-          }
-        }
-        // Caller: process answer
-        if (data.answer && user.uid === data.callerId && pc.current.signalingState === 'have-local-offer') {
-          try {
-            await pc.current.setRemoteDescription(new RTCSessionDescription(data.answer));
-            await drainIceBuffer();
-          } catch (e) {
-            console.error("Caller error setting answer:", e);
-          }
-        }
       }
 
       if (data.status === "ended" || data.status === "missed") {
@@ -1148,7 +1107,6 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
 
   const initializeMediaAndConnection = async () => {
     if (pc.current || !callData) return;
-
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: callData.type === "video" ? {
@@ -1156,7 +1114,7 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
           width: { ideal: 640 },
           height: { ideal: 480 }
         } : false,
-        audio: { echoCancellation: true, noiseSuppression: true }
+        audio: true
       });
       
       setLocalStream(stream);
@@ -1170,6 +1128,7 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
       peerConnection.ontrack = (event) => {
         if (event.streams && event.streams[0]) {
           setRemoteStream(event.streams[0]);
+          setIsConnecting(false);
         }
       };
 
@@ -1180,22 +1139,13 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
         }
       };
 
-      peerConnection.oniceconnectionstatechange = () => {
-        if (peerConnection.iceConnectionState === 'connected') {
-          setIsConnecting(false);
-        }
-      };
-
-      // Listen for incoming ICE candidates
       const candidatesPath = callData.callerId === user?.uid ? "calleeCandidates" : "callerCandidates";
       const unsubCandidates = onSnapshot(collection(db, "calls", callId, candidatesPath), (snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
           if (change.type === 'added' && pc.current && pc.current.signalingState !== 'closed') {
             const candidate = change.doc.data() as RTCIceCandidateInit;
             if (pc.current?.remoteDescription) {
-              try {
-                await pc.current.addIceCandidate(new RTCIceCandidate(candidate));
-              } catch (e) {}
+              try { await pc.current.addIceCandidate(new RTCIceCandidate(candidate)); } catch (e) {}
             } else {
               iceBuffer.current.push(candidate);
             }
@@ -1204,19 +1154,36 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
       });
       unsubscribes.current.push(unsubCandidates);
 
-      // Caller initiates
-      if (callData.callerId === user?.uid && peerConnection.signalingState === 'stable') {
+      if (callData.callerId === user?.uid) {
         const offer = await peerConnection.createOffer();
         await peerConnection.setLocalDescription(offer);
-        updateDoc(doc(db, "calls", callId), { 
-          offer: { sdp: offer.sdp, type: offer.type } 
-        });
+        updateDoc(doc(db, "calls", callId), { offer: { sdp: offer.sdp, type: offer.type } });
       }
     } catch (e: any) {
       setPermissionError(true);
       toast({ variant: "destructive", title: "Hardware Restricted", description: "Terminal access denied." });
     }
   };
+
+  useEffect(() => {
+    if (!pc.current || !callData || !user) return;
+    const processSignaling = async () => {
+      if (pc.current && pc.current.signalingState !== 'closed') {
+        if (callData.offer && user.uid === callData.calleeId && pc.current.signalingState === 'stable') {
+          await pc.current.setRemoteDescription(new RTCSessionDescription(callData.offer));
+          await drainIceBuffer();
+          const answer = await pc.current.createAnswer();
+          await pc.current.setLocalDescription(answer);
+          updateDoc(doc(db, "calls", callId), { answer: { type: answer.type, sdp: answer.sdp }, status: "active" });
+        }
+        if (callData.answer && user.uid === callData.callerId && pc.current.signalingState === 'have-local-offer') {
+          await pc.current.setRemoteDescription(new RTCSessionDescription(callData.answer));
+          await drainIceBuffer();
+        }
+      }
+    };
+    processSignaling();
+  }, [callData, user]);
 
   useEffect(() => {
     if (localVideoRef.current && localStream) localVideoRef.current.srcObject = localStream;
@@ -1226,16 +1193,13 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
     if (remoteStream) {
       if (remoteVideoRef.current) remoteVideoRef.current.srcObject = remoteStream;
       if (remoteAudioRef.current) remoteAudioRef.current.srcObject = remoteStream;
-      setIsConnecting(false);
     }
   }, [remoteStream]);
 
   useEffect(() => {
     let interval: any;
     if (callStartTime) {
-      interval = setInterval(() => {
-        setDuration(formatDuration(Date.now() - callStartTime));
-      }, 1000);
+      interval = setInterval(() => setDuration(formatDuration(Date.now() - callStartTime)), 1000);
     }
     return () => clearInterval(interval);
   }, [callStartTime]);
@@ -1243,21 +1207,13 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
   const endCall = async () => {
     if (!db || !callData) return;
     const status = callStartTime ? "ended" : "missed";
-    const finalDuration = callStartTime ? formatDuration(Date.now() - callStartTime) : "0:00";
-    
+    const finalDuration = duration;
     try {
       await updateDoc(doc(db, "calls", callId), { status });
       const chatId = [callData.callerId, callData.calleeId].sort().join("_");
       const logText = status === "missed" ? `Missed ${callData.type} call` : `${callData.type.toUpperCase()} call ended • ${finalDuration}`;
-      
-      await addDoc(collection(db, "chats", chatId, "messages"), {
-        senderId: callData.callerId,
-        text: logText,
-        timestamp: Date.now(),
-        status: "sent"
-      });
+      addDoc(collection(db, "chats", chatId, "messages"), { senderId: callData.callerId, text: logText, timestamp: Date.now(), status: "sent" });
     } catch (e) {}
-    
     cleanup();
     onEnd();
   };
@@ -1277,53 +1233,34 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
   };
 
   if (!callData) return null;
-
   const otherPersonName = callData.callerId === user?.uid ? callData.calleeName : callData.callerName;
   const otherPersonPhoto = callData.callerId === user?.uid ? callData.calleePhoto : callData.callerPhoto;
 
   return (
     <div className="fixed inset-0 z-[10000] bg-slate-950 flex flex-col items-center justify-center animate-in fade-in duration-500">
       <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
-      
       <div className="absolute inset-0 w-full h-full overflow-hidden flex items-center justify-center">
-        <video 
-          ref={remoteVideoRef} 
-          autoPlay 
-          playsInline 
-          className={`w-full h-full object-cover ${(callData.type !== "video" || !remoteStream) ? 'hidden' : ''}`}
-        />
+        <video ref={remoteVideoRef} autoPlay playsInline className={`w-full h-full object-cover ${(callData.type !== "video" || !remoteStream) ? 'hidden' : ''}`} />
         {(callData.type !== "video" || !remoteStream) && (
           <div className="flex flex-col items-center gap-6">
             <Avatar className="h-32 w-32 border-4 border-slate-800 shadow-2xl">
               <AvatarImage src={otherPersonPhoto} />
-              <AvatarFallback className="bg-slate-900 text-white text-4xl font-black">
-                {otherPersonName?.charAt(0)}
-              </AvatarFallback>
+              <AvatarFallback className="bg-slate-900 text-white text-4xl font-black">{otherPersonName?.charAt(0)}</AvatarFallback>
             </Avatar>
             <div className="text-center space-y-2">
-              <h2 className="text-2xl font-black text-white uppercase tracking-widest">
-                {isConnecting ? "Establishing Link..." : otherPersonName}
-              </h2>
+              <h2 className="text-2xl font-black text-white uppercase tracking-widest">{isConnecting ? "Establishing Link..." : otherPersonName}</h2>
               <div className="flex items-center justify-center gap-2">
                 <div className={`h-1.5 w-1.5 rounded-full ${callStartTime ? 'bg-green-500 animate-pulse' : 'bg-yellow-500 animate-bounce'}`} />
-                <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.4em]">
-                  {callStartTime ? `Active: ${duration}` : "Handshake Pending"}
-                </p>
+                <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.4em]">{callStartTime ? `Active: ${duration}` : "Handshake Pending"}</p>
               </div>
             </div>
           </div>
         )}
       </div>
-
       <div className={`absolute top-8 right-8 w-32 md:w-48 aspect-video bg-slate-900 rounded-2xl overflow-hidden border-2 border-slate-800 shadow-2xl z-20 ${callData.type !== "video" || permissionError ? 'hidden' : ''}`}>
         <video ref={localVideoRef} autoPlay muted playsInline className={`w-full h-full object-cover ${isVideoOff ? 'hidden' : ''}`} />
-        {isVideoOff && (
-          <div className="w-full h-full flex items-center justify-center bg-slate-900">
-            <VideoOff className="h-6 w-6 text-slate-700" />
-          </div>
-        )}
+        {isVideoOff && <div className="w-full h-full flex items-center justify-center bg-slate-900"><VideoOff className="h-6 w-6 text-slate-700" /></div>}
       </div>
-
       {permissionError && (
         <div className="absolute inset-0 z-50 bg-slate-950/90 backdrop-blur-md flex flex-col items-center justify-center p-8 text-center">
           <ShieldAlert className="h-16 w-16 text-red-500 mb-6" />
@@ -1331,26 +1268,22 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
           <Button onClick={endCall} variant="destructive" className="rounded-2xl px-12 h-14 font-black uppercase tracking-widest">Close Terminal</Button>
         </div>
       )}
-
       <div className="absolute bottom-12 flex items-center gap-6 z-[100] animate-in slide-in-from-bottom-8 duration-700">
-        <Button size="icon" variant="ghost" onClick={toggleMute} className={`h-14 w-14 rounded-2xl transition-all ${isMuted ? 'bg-red-500 text-white' : 'bg-slate-900/50 text-white hover:bg-slate-800'}`}>
+        <button onClick={toggleMute} className={`h-14 w-14 rounded-2xl flex items-center justify-center transition-all ${isMuted ? 'bg-red-500 text-white' : 'bg-slate-900/50 text-white hover:bg-slate-800'}`}>
           {isMuted ? <MicOff className="h-6 w-6" /> : <Mic className="h-6 w-6" />}
-        </Button>
-        <Button size="icon" onClick={endCall} className="h-18 w-18 rounded-3xl bg-red-600 hover:bg-red-700 text-white shadow-2xl active:scale-90 transition-all">
+        </button>
+        <button onClick={endCall} className="h-18 w-18 rounded-3xl bg-red-600 hover:bg-red-700 text-white shadow-2xl active:scale-90 transition-all flex items-center justify-center">
           <PhoneOff className="h-8 w-8" />
-        </Button>
+        </button>
         {callData.type === "video" && (
-          <Button size="icon" variant="ghost" onClick={toggleVideo} className={`h-14 w-14 rounded-2xl transition-all ${isVideoOff ? 'bg-red-500 text-white' : 'bg-slate-900/50 text-white hover:bg-slate-800'}`}>
+          <button onClick={toggleVideo} className={`h-14 w-14 rounded-2xl flex items-center justify-center transition-all ${isVideoOff ? 'bg-red-500 text-white' : 'bg-slate-900/50 text-white hover:bg-slate-800'}`}>
             {isVideoOff ? <VideoOff className="h-6 w-6" /> : <Video className="h-6 w-6" />}
-          </Button>
+          </button>
         )}
       </div>
-
       <div className="absolute top-8 left-1/2 -translate-x-1/2 bg-slate-900/80 backdrop-blur-md px-4 py-1.5 rounded-full border border-slate-800/50 flex items-center gap-2">
         <Clock className="h-3 w-3 text-slate-400" />
-        <span className="text-[8px] font-black text-slate-300 uppercase tracking-widest leading-none">
-          {callStartTime ? `Talk Time: ${duration}` : "Establishing Link"}
-        </span>
+        <span className="text-[8px] font-black text-slate-300 uppercase tracking-widest leading-none">{callStartTime ? `Talk Time: ${duration}` : "Establishing Link"}</span>
       </div>
     </div>
   );
