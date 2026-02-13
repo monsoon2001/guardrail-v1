@@ -984,7 +984,12 @@ interface CallOverlayProps {
 const servers = {
   iceServers: [
     {
-      urls: ['stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'],
+      urls: [
+        'stun:stun1.l.google.com:19302', 
+        'stun:stun2.l.google.com:19302',
+        'stun:stun3.l.google.com:19302',
+        'stun:stun4.l.google.com:19302'
+      ],
     },
   ],
   iceCandidatePoolSize: 10,
@@ -1026,8 +1031,8 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
   const stopStream = (streamRef: React.MutableRefObject<MediaStream | null>) => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => {
+        track.enabled = false; // Disable first for mobile lifecycle
         track.stop();
-        track.enabled = false;
       });
       streamRef.current = null;
     }
@@ -1207,7 +1212,11 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: callData.type === "video",
+        video: callData.type === "video" ? {
+          facingMode: "user",
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        } : false,
         audio: true
       });
       
@@ -1257,7 +1266,7 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
           snapshot.docChanges().forEach((change) => {
             if (change.type === 'added' && pc.current && pc.current.signalingState !== 'closed') {
               const candidate = change.doc.data() as RTCIceCandidateInit;
-              if (pc.current.remoteDescription) {
+              if (pc.current?.remoteDescription) {
                 pc.current.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
               } else {
                 iceBuffer.current.push(candidate);
@@ -1290,7 +1299,7 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
           snapshot.docChanges().forEach((change) => {
             if (change.type === 'added' && pc.current && pc.current.signalingState !== 'closed') {
               const candidate = change.doc.data() as RTCIceCandidateInit;
-              if (pc.current.remoteDescription) {
+              if (pc.current?.remoteDescription) {
                 pc.current.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
               } else {
                 iceBuffer.current.push(candidate);
@@ -1339,11 +1348,10 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
   if (!callData) return null;
 
   return (
-    <div className="fixed inset-0 z-[1000] bg-slate-950 flex flex-col items-center justify-center animate-in fade-in duration-500">
+    <div className="fixed inset-0 z-[10000] bg-slate-950 flex flex-col items-center justify-center animate-in fade-in duration-500">
       <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
 
       <div className="absolute inset-0 w-full h-full overflow-hidden flex items-center justify-center">
-        {/* Remote Video Container - Always Present for hardware lifecycle */}
         <video 
           ref={remoteVideoRef} 
           autoPlay 
@@ -1374,7 +1382,6 @@ export function CallOverlay({ callId, onEnd }: CallOverlayProps) {
         )}
       </div>
 
-      {/* Local Video - Always Present for hardware lifecycle */}
       <div className={`absolute top-8 right-8 w-32 md:w-48 aspect-video bg-slate-900 rounded-2xl overflow-hidden border-2 border-slate-800 shadow-2xl z-20 ${callData.type !== "video" || permissionError ? 'hidden' : ''}`}>
         <video 
           ref={localVideoRef} 
